@@ -1,237 +1,206 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 
-// -- Tipos simples de mensagens
-type Msg = { role: "user" | "alma"; text: string };
+type Message = { who: "You" | "Alma"; text: string };
 
-// --------- UTIL: tocar TTS da resposta ---------
-async function playTTS(text: string) {
-  const t = (text || "").trim();
-  if (!t) return;
-
-  const r = await fetch("/api/tts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: t }),
-  });
-
-  if (!r.ok) {
-    // Não quebrar o fluxo se TTS falhar — só loga
-    console.error("TTS falhou:", await r.text());
-    return;
-  }
-
-  const blob = await r.blob(); // esperamos audio/mpeg
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  try {
-    await audio.play();
-  } catch (e) {
-    // iOS/Chrome podem bloquear 1ª reprodução sem gesto
-    console.warn("Autoplay bloqueado; o áudio tocará após um clique.", e);
-  } finally {
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-  }
-}
-
-// -------------- Página ----------------
 export default function Page() {
-  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isHolding, setIsHolding] = useState(false);
-  const [isSending, setIsSending] = useState(false);
 
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
 
-  // scroll simples p/ o fim quando novas msgs chegam
-  const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [msgs]);
+  // ---------- utils ----------
+  function append(who: Message["who"], text: string) {
+    setMessages((m) => [...m, { who, text }]);
+  }
 
-  // --------- Enviar texto para a Alma ---------
-  async function sendText(question: string) {
-    const q = question.trim();
-    if (!q) return;
+  // mantém o mesmo fluxo de TEXTO -> /api/alma -> /api/tts que já estava ok
+  async function askAlma(question: string): Promise<string> {
+    const r = await fetch("/api/alma", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const j = await r.json();
+    return (j?.answer || "").trim();
+  }
 
-    setIsSending(true);
-    setMsgs((m) => [...m, { role: "user", text: q }]);
-
+  async function playTTS(text: string) {
+    const r = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      append("Alma", `⚠️ Erro no TTS: ${r.status} ${t}`);
+      return;
+    }
+    const buf = await r.arrayBuffer();
+    const blob = new Blob([buf], { type: "audio/mpeg" });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
     try {
-      const r = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q }),
-      });
+      await audio.play();
+    } catch {
+      append(
+        "Alma",
+        "⚠️ O navegador bloqueou o áudio automático. Toca no ecrã e tenta de novo."
+      );
+    }
+    audio.onended = () => URL.revokeObjectURL(url);
+  }
 
-      const j = await r.json();
-      const answer = (j?.answer ?? "").toString();
-
-      setMsgs((m) => [...m, { role: "alma", text: answer }]);
-
-      // 🚀 NOVO: dar VOZ à resposta da Alma
-      await playTTS(answer);
-    } catch (e: any) {
-      const msg = "⚠️ Erro a contactar a Alma.";
-      setMsgs((m) => [...m, { role: "alma", text: msg }]);
-      console.error(msg, e);
-    } finally {
-      setIsSending(false);
+  async function sendText() {
+    const q = input.trim();
+    if (!q) return;
+    setInput("");
+    append("You", q);
+    const a = await askAlma(q);
+    if (a) {
+      append("Alma", a);
+      await playTTS(a); // mantém o comportamento que já funcionava
     }
   }
 
-  // --------- Gravação (HOLD) → STT → /api/alma ---------
-  async function startHold() {
-    // gesto do utilizador: pedido de micro
-    setIsHolding(true);
-    chunksRef.current = [];
+  // ---------- STT (apenas acrescenta o hold) ----------
+  function pickBestMime(): string {
+    const cands = [
+      "audio/webm;codecs=opus",
+      "audio/ogg;codecs=opus",
+      "audio/webm",
+      "audio/ogg",
+      "audio/mp4", // safari / iOS
+    ];
+    for (const c of cands) {
+      if ((window as any).MediaRecorder?.isTypeSupported?.(c)) return c;
+    }
+    return "audio/webm";
+  }
 
+  async function ensureMic(): Promise<MediaStream> {
+    if (mediaStreamRef.current) return mediaStreamRef.current;
+    const s = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    mediaStreamRef.current = s;
+    return s;
+  }
+
+  async function sendBlobToSTT(blob: Blob): Promise<string> {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+      const res = await fetch("/api/stt", {
+        method: "POST",
+        headers: { "Content-Type": blob.type || "audio/webm" },
+        body: blob, // envia bruto, sem FormData
       });
+      const j = await res.json();
+      if (!res.ok) {
+        append("Alma", `⚠️ STT ${res.status}: ${JSON.stringify(j)}`);
+        return "";
+      }
+      const t = (j?.transcript || "").trim();
+      if (!t) append("Alma", "⚠️ Falha na transcrição");
+      return t;
+    } catch (e: any) {
+      append("Alma", `⚠️ Erro no STT: ${e?.message || String(e)}`);
+      return "";
+    }
+  }
 
-      const mime =
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : "audio/webm";
+  async function startHold() {
+    try {
+      const stream = await ensureMic();
+      const mimeType = pickBestMime();
 
-      const rec = new MediaRecorder(stream, { mimeType: mime });
+      chunksRef.current = [];
+      const rec = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = rec;
 
       rec.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
 
-      rec.start(100); // pequenos chunks
-    } catch (err) {
-      console.error("Permissão de micro negada ou indisponível:", err);
+      rec.onstop = async () => {
+        try {
+          const blob = new Blob(chunksRef.current, { type: mimeType });
+          chunksRef.current = [];
+          const transcript = await sendBlobToSTT(blob);
+          if (!transcript) return;
+
+          append("You", transcript);
+          const answer = await askAlma(transcript);
+          if (answer) {
+            append("Alma", answer);
+            await playTTS(answer);
+          }
+        } catch (e: any) {
+          append("Alma", `⚠️ Erro ao processar áudio: ${e?.message || String(e)}`);
+        }
+      };
+
+      rec.start(250);
+      setIsHolding(true);
+    } catch (e: any) {
+      append("Alma", `⚠️ Erro a iniciar microfone: ${e?.message || String(e)}`);
       setIsHolding(false);
     }
   }
 
   async function stopHold() {
-    setIsHolding(false);
-
-    const rec = mediaRecorderRef.current;
-    if (!rec) return;
-
-    // parar e esperar pelos últimos chunks
-    await new Promise<void>((resolve) => {
-      rec.onstop = () => resolve();
-      rec.stop();
-    });
-
-    // largar tracks do micro
     try {
-      (rec.stream.getTracks() || []).forEach((t) => t.stop());
-    } catch {}
-
-    const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
-    chunksRef.current = [];
-
-    // mandar p/ STT (exactamente como já tinhas)
-    try {
-      const fd = new FormData();
-      fd.append("audio", blob, "speech.webm");
-
-      // se o teu /api/stt aceita lang, podes enviar:
-      // fd.append("lang", "pt-PT");
-
-      const sttRes = await fetch("/api/stt", {
-        method: "POST",
-        body: fd,
-      });
-
-      const sttJson = await sttRes.json();
-      const transcript = (sttJson?.transcript || "").toString().trim();
-
-      if (!transcript) {
-        setMsgs((m) => [
-          ...m,
-          { role: "alma", text: "⚠️ Falha na transcrição" },
-        ]);
-        return;
-      }
-
-      // mostrar o que o user disse
-      setMsgs((m) => [...m, { role: "user", text: transcript }]);
-
-      // perguntar à Alma
-      await sendText(transcript);
-    } catch (err) {
-      setMsgs((m) => [
-        ...m,
-        { role: "alma", text: "⚠️ Não consegui transcrever. Tenta outra vez." },
-      ]);
-      console.error("Erro no STT:", err);
+      const rec = mediaRecorderRef.current;
+      if (rec && rec.state !== "inactive") rec.stop();
+    } finally {
+      setIsHolding(false);
     }
   }
 
-  // ---------- UI mínima (input + hold + lista de msgs) ----------
+  // ---------- UI simples ----------
   return (
-    <div className="min-h-dvh w-full max-w-2xl mx-auto p-4 flex flex-col gap-4">
+    <main className="max-w-xl mx-auto p-4 space-y-4">
       <h1 className="text-xl font-semibold">Alma — voz & texto</h1>
 
-      <div className="flex-1 overflow-y-auto rounded border p-3 bg-white/5">
-        {msgs.map((m, i) => (
-          <div
-            key={i}
-            className={`mb-2 ${
-              m.role === "user" ? "text-blue-300" : "text-emerald-300"
-            }`}
-          >
-            <strong>{m.role === "user" ? "Tu" : "Alma"}:</strong> {m.text}
+      <div className="border rounded p-2 h-64 overflow-y-auto bg-white/5">
+        {messages.map((m, i) => (
+          <div key={i} className="mb-2">
+            <strong>{m.who}:</strong> {m.text}
           </div>
         ))}
-        <div ref={endRef} />
       </div>
 
-      <form
-        className="flex gap-2"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          if (isSending) return;
-          const v = input;
-          setInput("");
-          await sendText(v);
-        }}
-      >
-        <input
-          type="text"
-          className="flex-1 rounded border px-3 py-2 text-black"
-          placeholder="Escreve para a Alma…"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-        />
-        <button
-          type="submit"
-          disabled={isSending}
-          className="rounded bg-emerald-600 text-white px-4 py-2 disabled:opacity-50"
-        >
-          {isSending ? "…" : "Enviar"}
-        </button>
-      </form>
-
-      <div className="flex items-center gap-3">
+      <div className="flex gap-2">
         <button
           onMouseDown={startHold}
           onMouseUp={stopHold}
-          onMouseLeave={() => isHolding && stopHold()}
           onTouchStart={startHold}
           onTouchEnd={stopHold}
-          className={`rounded px-4 py-2 text-white ${
+          className={`px-4 py-2 rounded ${
             isHolding ? "bg-red-600" : "bg-blue-600"
-          }`}
+          } text-white`}
         >
-          {isHolding ? "A gravar… (largar p/ enviar)" : "Manter premido p/ falar"}
+          {isHolding ? "A gravar…" : "Manter p/ Falar"}
         </button>
-        <span className="text-sm opacity-70">
-          Dica: mantém premido, fala, e larga para enviar.
-        </span>
+
+        <input
+          className="flex-1 border rounded px-2"
+          placeholder="Escreve e Enter…"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && sendText()}
+        />
+        <button onClick={sendText} className="px-3 py-2 rounded bg-green-600 text-white">
+          Enviar
+        </button>
       </div>
-    </div>
+    </main>
   );
 }
