@@ -1,0 +1,22 @@
+{
+  "name": "alma-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 8080",
+    "build": "next build",
+    "start": "next start -p 8080"
+  },
+  "dependencies": {
+    "next": "15.3.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.11.30",
+    "@types/react": "19.0.1",
+    "@types/react-dom": "19.1.2",
+    "typescript": "5.5.3"
+  }
+}
