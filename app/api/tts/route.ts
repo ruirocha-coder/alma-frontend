@@ -1,60 +1,60 @@
-// app/api/tts/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
     const { text } = await req.json();
 
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID;
-    // Opcional: escolhe o que quiseres no .env (estes funcionam bem)
-    const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
+    if (!text) {
+      return NextResponse.json({ error: "Texto vazio" }, { status: 400 });
+    }
 
-    if (!apiKey || !voiceId) {
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+
+    if (!voiceId || !apiKey) {
       return NextResponse.json(
-        { error: "Falta ELEVENLABS_API_KEY ou ELEVENLABS_VOICE_ID" },
+        { error: "Configuração TTS em falta" },
         { status: 500 }
       );
     }
 
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=4&output_format=mp3_44100_128`;
-
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "xi-api-key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        text,
-        model_id: modelId,
-        // Ajusta se quiseres: deixa simples
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": apiKey,
+          "Content-Type": "application/json",
         },
-      }),
-    });
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_multilingual_v2", // 👈 modelo mais robusto
+          voice_settings: {
+            stability: 0.6,
+            similarity_boost: 0.8,
+          },
+        }),
+      }
+    );
 
-    if (!r.ok) {
-      const errTxt = await r.text().catch(() => "");
-      return new NextResponse(`TTS error: ${r.status} ${errTxt}`, {
-        status: 502,
-      });
+    if (!response.ok) {
+      const errText = await response.text();
+      return NextResponse.json(
+        { error: `TTS error: ${response.status} ${errText}` },
+        { status: response.status }
+      );
     }
 
-    // Passa o áudio tal como vem (streaming)
-    const body = r.body!;
-    return new Response(body as any, {
+    const audioBuffer = await response.arrayBuffer();
+
+    return new NextResponse(audioBuffer, {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
-        "Cache-Control": "no-store",
+        "Content-Length": audioBuffer.byteLength.toString(),
       },
     });
-  } catch (e: any) {
-    return new NextResponse(`TTS exception: ${e?.message || e}`, {
-      status: 500,
-    });
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
