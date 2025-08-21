@@ -1,239 +1,314 @@
-// app/page.tsx
-'use client';
+"use client";
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
-type ChatTurn = { role: 'user' | 'alma'; text: string };
+type Msg = { role: "user" | "alma" | "system"; text: string };
 
 export default function Page() {
-  const [audioUnlocked, setAudioUnlocked] = useState(false);
-  const [volume, setVolume] = useState(0.9);
-  const [testing, setTesting] = useState(false);
-  const [input, setInput] = useState('Olá! Sou a Alma. Está a ouvir-me bem?');
-  const [chat, setChat] = useState<ChatTurn[]>([]);
+  // UI state
+  const [messages, setMessages] = useState<Msg[]>([
+    {
+      role: "system",
+      text:
+        "🎧 Mantém o botão premido para falar. Solta para eu responder. Ou escreve abaixo.",
+    },
+  ]);
+  const [input, setInput] = useState("");
+  const [recording, setRecording] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // Mic & Recorder
+  const streamRef = useRef<MediaStream | null>(null);
+  const recRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+  const preferredMime = useRef<string>("");
+
+  // Audio TTS
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const objectUrlRef = useRef<string | null>(null);
-
-  // Limpeza de URL de blob para evitar leaks
-  const cleanupAudio = useCallback(() => {
-    try {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.src = '';
-        audioRef.current = null;
-      }
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-        objectUrlRef.current = null;
-      }
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    return () => cleanupAudio();
-  }, [cleanupAudio]);
-
-  // Desbloqueio de áudio em iOS: tocar 200ms de silêncio conta como gesto válido
-  const unlockAudio = useCallback(async () => {
-    try {
-      // pequeno mp3 silencioso (data URI) — o play num clique “autoriza” a sessão
-      const silent = new Audio(
-        // 200ms de silêncio (mp3 minúsculo)
-        'data:audio/mp3;base64,//uQZAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCA//////////////////////////////////////////8='
-      );
-      silent.volume = 0;
-      await silent.play();
-      silent.pause();
-
-      setAudioUnlocked(true);
-    } catch (e) {
-      alert('Não foi possível desbloquear o áudio. Tenta clicar novamente.');
+  const ensureAudio = () => {
+    if (!audioRef.current) {
+      const el = document.createElement("audio");
+      el.setAttribute("playsinline", "true");
+      el.preload = "auto";
+      document.body.appendChild(el);
+      audioRef.current = el;
     }
-  }, []);
+  };
 
-  // Falar (TTS)
-  const speak = useCallback(
-    async (text: string) => {
-      if (!audioUnlocked) {
-        alert('Clica primeiro em "Permitir áudio" para eu poder falar 🙂');
-        return;
-      }
-      cleanupAudio();
-
-      const res = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+  const speak = useCallback(async (text: string) => {
+    try {
+      ensureAudio();
+      const r = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
-
-      if (!res.ok) {
-        const errTxt = await res.text();
-        throw new Error(`TTS error: ${res.status} ${errTxt}`);
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        throw new Error(`TTS error: ${r.status} ${t}`);
       }
-
-      const blob = await res.blob();
+      const blob = await r.blob();
       const url = URL.createObjectURL(blob);
-      objectUrlRef.current = url;
+      const el = audioRef.current!;
+      el.src = url;
 
-      const audio = new Audio(url);
-      audio.volume = volume;
-      audioRef.current = audio;
-
-      await audio.play();
-      audio.onended = () => {
-        // limpeza suave após terminar
-        cleanupAudio();
-      };
-    },
-    [audioUnlocked, cleanupAudio, volume]
-  );
-
-  // Teste rápido de voz
-  const handleTestVoice = useCallback(async () => {
-    try {
-      setTesting(true);
-      await speak(input.trim() || 'Olá! Este é um teste de voz.');
-    } catch (e: any) {
-      console.error(e);
-      alert(`Erro no /api/tts: ${e?.message || e}`);
-    } finally {
-      setTesting(false);
-    }
-  }, [input, speak]);
-
-  // Exemplo de ciclo completo: USER → /api/alma → FALAR
-  const handleAsk = useCallback(async () => {
-    const q = input.trim();
-    if (!q) return;
-
-    setChat((c) => [...c, { role: 'user', text: q }]);
-    setInput('');
-
-    try {
-      const r = await fetch('/api/alma', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q }),
+      await el.play().catch(async () => {
+        // 2ª tentativa (iOS às vezes precisa de mais do que 1 chamada)
+        await el.play();
       });
 
-      if (!r.ok) {
-        const txt = await r.text();
-        throw new Error(`Erro no /api/alma: ${r.status} ${txt}`);
-      }
+      el.onended = () => URL.revokeObjectURL(url);
+    } catch (e: any) {
+      console.error("Erro a reproduzir TTS:", e?.message || e);
+      setErr("Não consegui reproduzir áudio agora.");
+    }
+  }, []);
 
-      const { answer } = await r.json();
-      const final = answer || 'Sem resposta agora.';
+  // Permissões micro
+  const askMic = useCallback(async () => {
+    try {
+      if (streamRef.current) return;
 
-      setChat((c) => [...c, { role: 'alma', text: final }]);
+      // Descobre um MIME suportado
+      const candidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/mp4;codecs=mp4a.40.2",
+        "audio/mp4",
+      ];
+      const ok = candidates.find((c) => MediaRecorder.isTypeSupported(c));
+      preferredMime.current = ok || "";
 
-      // falar resposta
-      await speak(final);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
+      streamRef.current = stream;
+      setErr(null);
+      setMessages((m) => [
+        ...m,
+        { role: "system", text: "✅ Microfone autorizado." },
+      ]);
     } catch (e: any) {
       console.error(e);
-      setChat((c) => [
-        ...c,
-        { role: 'alma', text: 'Ups — ocorreu um erro a obter resposta.' },
-      ]);
+      setErr("Não consegui aceder ao microfone.");
     }
+  }, []);
+
+  // Gravação
+  const startRecording = useCallback(async () => {
+    try {
+      if (!streamRef.current) await askMic();
+      if (!streamRef.current) return;
+
+      chunksRef.current = [];
+      const rec = new MediaRecorder(streamRef.current, {
+        mimeType: preferredMime.current || undefined,
+        audioBitsPerSecond: 128000,
+      });
+      recRef.current = rec;
+      rec.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+      };
+      rec.start();
+      setRecording(true);
+      setErr(null);
+    } catch (e: any) {
+      console.error(e);
+      setErr("Falha ao iniciar gravação.");
+    }
+  }, [askMic]);
+
+  const stopRecording = useCallback(async () => {
+    try {
+      const rec = recRef.current;
+      if (!rec || rec.state === "inactive") return;
+
+      const stopped = new Promise<void>((resolve) => {
+        rec.onstop = () => resolve();
+      });
+      rec.stop();
+      setRecording(false);
+      await stopped;
+
+      const mime =
+        preferredMime.current ||
+        (chunksRef.current[0] as any)?.type ||
+        "audio/webm";
+
+      const blob = new Blob(chunksRef.current, { type: mime });
+      chunksRef.current = [];
+
+      // 1) STT
+      setIsThinking(true);
+      const text = await transcribe(blob, mime);
+      if (!text) {
+        setIsThinking(false);
+        return;
+      }
+      setMessages((m) => [...m, { role: "user", text }]);
+
+      // 2) Grok (Alma)
+      const answer = await askAlma(text);
+      setMessages((m) => [...m, { role: "alma", text: answer }]);
+
+      // 3) TTS
+      await speak(answer);
+      setIsThinking(false);
+    } catch (e: any) {
+      console.error(e);
+      setErr("Falha ao terminar gravação.");
+      setIsThinking(false);
+    }
+  }, [speak]);
+
+  // STT helper
+  async function transcribe(blob: Blob, mime: string): Promise<string | null> {
+    try {
+      const fd = new FormData();
+      fd.append("audio", blob, `audio.${mime.includes("mp4") ? "mp4" : "webm"}`);
+      fd.append("mime", mime);
+
+      const r = await fetch("/api/stt", {
+        method: "POST",
+        body: fd,
+      });
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        setErr(`Erro no STT: ${t || r.status}`);
+        return null;
+      }
+      const j = (await r.json()) as { text?: string };
+      if (!j?.text) {
+        setErr("Não consegui transcrever o áudio. Tenta falar mais perto.");
+        return null;
+      }
+      return j.text;
+    } catch (e: any) {
+      console.error(e);
+      setErr("Não consegui transcrever o áudio. Tenta falar mais perto.");
+      return null;
+    }
+  }
+
+  // Alma helper (Grok)
+  async function askAlma(question: string): Promise<string> {
+    try {
+      const r = await fetch("/api/alma", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        throw new Error(t || `HTTP ${r.status}`);
+      }
+      const j = (await r.json()) as { answer?: string };
+      return j.answer || "Não consegui obter resposta agora.";
+    } catch (e: any) {
+      console.error(e);
+      return "Tive um problema a contactar o cérebro (Grok).";
+    }
+  }
+
+  // Envio por texto
+  const sendText = useCallback(async () => {
+    const q = input.trim();
+    if (!q) return;
+    setInput("");
+    setMessages((m) => [...m, { role: "user", text: q }]);
+    setIsThinking(true);
+    const a = await askAlma(q);
+    setMessages((m) => [...m, { role: "alma", text: a }]);
+    await speak(a);
+    setIsThinking(false);
   }, [input, speak]);
 
+  // Tecla Enter envia
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        sendText();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sendText]);
+
+  // UI
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="max-w-3xl mx-auto p-4 md:p-8 flex flex-col gap-6">
-        <h1 className="text-2xl md:text-3xl font-semibold">
-          🎧 Alma – voz & texto
-        </h1>
+    <div className="min-h-dvh w-full max-w-3xl mx-auto px-4 py-6 flex flex-col gap-4 text-zinc-100 bg-zinc-950">
+      <h1 className="text-xl font-semibold">Alma — voz em tempo quase real</h1>
 
-        {/* Barra de controlo */}
-        <div className="flex flex-col md:flex-row items-start md:items-center gap-3 md:gap-6 rounded-lg border border-zinc-800 p-4">
-          <button
-            onClick={unlockAudio}
-            className={`px-4 py-2 rounded-md ${
-              audioUnlocked
-                ? 'bg-emerald-600 hover:bg-emerald-500'
-                : 'bg-indigo-600 hover:bg-indigo-500'
-            }`}
-          >
-            {audioUnlocked ? 'Áudio desbloqueado ✅' : 'Permitir áudio 🔈'}
-          </button>
-
-          <div className="flex items-center gap-3">
-            <label className="text-sm opacity-80">Volume</label>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={volume}
-              onChange={(e) => setVolume(parseFloat(e.target.value))}
-            />
-            <span className="text-sm tabular-nums">{Math.round(volume * 100)}%</span>
-          </div>
-
-          <button
-            onClick={handleTestVoice}
-            disabled={testing}
-            className="px-4 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700 disabled:opacity-60"
-          >
-            {testing ? 'A testar…' : 'Testar voz'}
-          </button>
-        </div>
-
-        {/* Caixa de entrada */}
-        <div className="flex flex-col gap-3 rounded-lg border border-zinc-800 p-4">
-          <textarea
-            className="w-full min-h-[80px] rounded-md bg-zinc-900 p-3 outline-none"
-            placeholder="Escreve algo para eu dizer…"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-          />
-          <div className="flex gap-3">
-            <button
-              onClick={handleTestVoice}
-              className="px-4 py-2 rounded-md bg-zinc-800 hover:bg-zinc-700"
-            >
-              Dizer (só voz)
-            </button>
-            <button
-              onClick={handleAsk}
-              className="px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500"
-            >
-              Perguntar à Alma (voz + texto)
-            </button>
-          </div>
-        </div>
-
-        {/* Histórico simples */}
-        <div className="rounded-lg border border-zinc-800">
-          <div className="px-4 py-2 border-b border-zinc-800 text-sm opacity-70">
-            Histórico
-          </div>
-          <div className="p-4 flex flex-col gap-3">
-            {chat.length === 0 && (
-              <div className="opacity-60 text-sm">
-                Sem mensagens ainda. Escreve algo acima.
-              </div>
-            )}
-            {chat.map((t, i) => (
-              <div
-                key={i}
-                className={`p-3 rounded-md ${
-                  t.role === 'user' ? 'bg-zinc-900' : 'bg-zinc-800'
-                }`}
-              >
-                <div className="text-xs opacity-60 mb-1">
-                  {t.role === 'user' ? 'Tu' : 'Alma'}
-                </div>
-                <div>{t.text}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="text-xs opacity-60">
-          Dica iPad/Safari: clica em <em>Permitir áudio</em> antes de usar.
-        </div>
+      <div className="flex gap-2">
+        <button
+          className="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700"
+          onClick={askMic}
+        >
+          Permitir micro
+        </button>
+        <button
+          className={`px-3 py-2 rounded ${
+            recording ? "bg-red-600" : "bg-emerald-700 hover:bg-emerald-600"
+          }`}
+          onMouseDown={startRecording}
+          onMouseUp={stopRecording}
+          onTouchStart={startRecording}
+          onTouchEnd={stopRecording}
+        >
+          {recording ? "A gravar… solta para enviar" : "Manter premido para falar"}
+        </button>
+        <button
+          className="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700"
+          onClick={() => speak("Teste de voz da Alma. 1, 2, 3.")}
+        >
+          Testar voz
+        </button>
       </div>
-    </main>
+
+      {isThinking && (
+        <div className="text-sm text-zinc-300">A pensar…</div>
+      )}
+
+      {err && (
+        <div className="text-sm text-red-400">⚠️ {err}</div>
+      )}
+
+      <div className="flex flex-col gap-2 border border-zinc-800 rounded p-3 max-h-[50vh] overflow-auto">
+        {messages.map((m, i) => (
+          <div key={i}>
+            <span
+              className={`text-xs mr-2 ${
+                m.role === "user"
+                  ? "text-sky-400"
+                  : m.role === "alma"
+                  ? "text-emerald-400"
+                  : "text-zinc-400"
+              }`}
+            >
+              {m.role.toUpperCase()}
+            </span>
+            <span className="whitespace-pre-wrap">{m.text}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex gap-2">
+        <input
+          className="flex-1 px-3 py-2 rounded bg-zinc-900 border border-zinc-800"
+          placeholder="Escreve aqui… (⌘/Ctrl + Enter para enviar)"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+        <button
+          className="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700"
+          onClick={sendText}
+        >
+          Enviar
+        </button>
+      </div>
+    </div>
   );
 }
