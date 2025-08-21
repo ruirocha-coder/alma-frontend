@@ -1,68 +1,59 @@
 // app/api/tts/route.ts
-import { NextRequest } from "next/server";
+import { NextResponse } from "next/server";
 
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY!;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID!;
-// Opcional: força um modelo; bom para PT:
-const ELEVENLABS_MODEL_ID =
-  process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
-
-// latência baixa para streaming; 4 é equilibrado
-const STREAM_LATENCY = 4;
-
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
-    if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
-      return new Response("ELEVENLABS_API_KEY/VOICE_ID em falta", {
-        status: 500,
-      });
-    }
-
     const { text } = await req.json();
-    if (!text || typeof text !== "string") {
-      return new Response("Campo 'text' inválido", { status: 400 });
+
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    // Opcional: escolhe o que quiseres no .env (estes funcionam bem)
+    const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5";
+
+    if (!apiKey || !voiceId) {
+      return NextResponse.json(
+        { error: "Falta ELEVENLABS_API_KEY ou ELEVENLABS_VOICE_ID" },
+        { status: 500 }
+      );
     }
 
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=${STREAM_LATENCY}`;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=4&output_format=mp3_44100_128`;
 
-    const elRes = await fetch(url, {
+    const r = await fetch(url, {
       method: "POST",
       headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
+        "xi-api-key": apiKey,
         "Content-Type": "application/json",
-        Accept: "audio/mpeg",
       },
       body: JSON.stringify({
         text,
-        model_id: ELEVENLABS_MODEL_ID,
-        // afinações suaves e naturais; ajusta ao teu gosto:
+        model_id: modelId,
+        // Ajusta se quiseres: deixa simples
         voice_settings: {
-          stability: 0.4,
-          similarity_boost: 0.6,
-          style: 0.3,
-          use_speaker_boost: true,
+          stability: 0.5,
+          similarity_boost: 0.75,
         },
       }),
     });
 
-    if (!elRes.ok) {
-      const errTxt = await elRes.text();
-      return new Response(`TTS error: ${elRes.status} ${errTxt}`, {
+    if (!r.ok) {
+      const errTxt = await r.text().catch(() => "");
+      return new NextResponse(`TTS error: ${r.status} ${errTxt}`, {
         status: 502,
       });
     }
 
-    // devolve áudio diretamente ao browser
-    const audioBuf = Buffer.from(await elRes.arrayBuffer());
-    return new Response(audioBuf, {
+    // Passa o áudio tal como vem (streaming)
+    const body = r.body!;
+    return new Response(body as any, {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
         "Cache-Control": "no-store",
       },
     });
-  } catch (err: any) {
-    return new Response(`Erro no /api/tts: ${err?.message || String(err)}`, {
+  } catch (e: any) {
+    return new NextResponse(`TTS exception: ${e?.message || e}`, {
       status: 500,
     });
   }
