@@ -1,314 +1,153 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useState, useRef } from "react";
 
-type Msg = { role: "user" | "alma" | "system"; text: string };
+export default function Home() {
+  const [list, setList] = useState<string[]>([]);
+  const [loading, setLoading] = useState(false);
+  const mediaStream = useRef<MediaStream | null>(null);
+  const mediaProcessor = useRef<ScriptProcessorNode | null>(null);
+  const audioContext = useRef<AudioContext | null>(null);
+  const bufferData = useRef<Float32Array[]>([]);
+  const recording = useRef(false);
 
-export default function Page() {
-  // UI state
-  const [messages, setMessages] = useState<Msg[]>([
-    {
-      role: "system",
-      text:
-        "🎧 Mantém o botão premido para falar. Solta para eu responder. Ou escreve abaixo.",
-    },
-  ]);
-  const [input, setInput] = useState("");
-  const [recording, setRecording] = useState(false);
-  const [isThinking, setIsThinking] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  // 🎙️ Iniciar captura
+  async function startRec() {
+    audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+      sampleRate: 16000, // força 16kHz
+    });
 
-  // Mic & Recorder
-  const streamRef = useRef<MediaStream | null>(null);
-  const recRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
-  const preferredMime = useRef<string>("");
+    mediaStream.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const source = audioContext.current.createMediaStreamSource(mediaStream.current);
 
-  // Audio TTS
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const ensureAudio = () => {
-    if (!audioRef.current) {
-      const el = document.createElement("audio");
-      el.setAttribute("playsinline", "true");
-      el.preload = "auto";
-      document.body.appendChild(el);
-      audioRef.current = el;
-    }
-  };
-
-  const speak = useCallback(async (text: string) => {
-    try {
-      ensureAudio();
-      const r = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (!r.ok) {
-        const t = await r.text().catch(() => "");
-        throw new Error(`TTS error: ${r.status} ${t}`);
-      }
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const el = audioRef.current!;
-      el.src = url;
-
-      await el.play().catch(async () => {
-        // 2ª tentativa (iOS às vezes precisa de mais do que 1 chamada)
-        await el.play();
-      });
-
-      el.onended = () => URL.revokeObjectURL(url);
-    } catch (e: any) {
-      console.error("Erro a reproduzir TTS:", e?.message || e);
-      setErr("Não consegui reproduzir áudio agora.");
-    }
-  }, []);
-
-  // Permissões micro
-  const askMic = useCallback(async () => {
-    try {
-      if (streamRef.current) return;
-
-      // Descobre um MIME suportado
-      const candidates = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/mp4;codecs=mp4a.40.2",
-        "audio/mp4",
-      ];
-      const ok = candidates.find((c) => MediaRecorder.isTypeSupported(c));
-      preferredMime.current = ok || "";
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: false,
-      });
-      streamRef.current = stream;
-      setErr(null);
-      setMessages((m) => [
-        ...m,
-        { role: "system", text: "✅ Microfone autorizado." },
-      ]);
-    } catch (e: any) {
-      console.error(e);
-      setErr("Não consegui aceder ao microfone.");
-    }
-  }, []);
-
-  // Gravação
-  const startRecording = useCallback(async () => {
-    try {
-      if (!streamRef.current) await askMic();
-      if (!streamRef.current) return;
-
-      chunksRef.current = [];
-      const rec = new MediaRecorder(streamRef.current, {
-        mimeType: preferredMime.current || undefined,
-        audioBitsPerSecond: 128000,
-      });
-      recRef.current = rec;
-      rec.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
-      };
-      rec.start();
-      setRecording(true);
-      setErr(null);
-    } catch (e: any) {
-      console.error(e);
-      setErr("Falha ao iniciar gravação.");
-    }
-  }, [askMic]);
-
-  const stopRecording = useCallback(async () => {
-    try {
-      const rec = recRef.current;
-      if (!rec || rec.state === "inactive") return;
-
-      const stopped = new Promise<void>((resolve) => {
-        rec.onstop = () => resolve();
-      });
-      rec.stop();
-      setRecording(false);
-      await stopped;
-
-      const mime =
-        preferredMime.current ||
-        (chunksRef.current[0] as any)?.type ||
-        "audio/webm";
-
-      const blob = new Blob(chunksRef.current, { type: mime });
-      chunksRef.current = [];
-
-      // 1) STT
-      setIsThinking(true);
-      const text = await transcribe(blob, mime);
-      if (!text) {
-        setIsThinking(false);
-        return;
-      }
-      setMessages((m) => [...m, { role: "user", text }]);
-
-      // 2) Grok (Alma)
-      const answer = await askAlma(text);
-      setMessages((m) => [...m, { role: "alma", text: answer }]);
-
-      // 3) TTS
-      await speak(answer);
-      setIsThinking(false);
-    } catch (e: any) {
-      console.error(e);
-      setErr("Falha ao terminar gravação.");
-      setIsThinking(false);
-    }
-  }, [speak]);
-
-  // STT helper
-  async function transcribe(blob: Blob, mime: string): Promise<string | null> {
-    try {
-      const fd = new FormData();
-      fd.append("audio", blob, `audio.${mime.includes("mp4") ? "mp4" : "webm"}`);
-      fd.append("mime", mime);
-
-      const r = await fetch("/api/stt", {
-        method: "POST",
-        body: fd,
-      });
-      if (!r.ok) {
-        const t = await r.text().catch(() => "");
-        setErr(`Erro no STT: ${t || r.status}`);
-        return null;
-      }
-      const j = (await r.json()) as { text?: string };
-      if (!j?.text) {
-        setErr("Não consegui transcrever o áudio. Tenta falar mais perto.");
-        return null;
-      }
-      return j.text;
-    } catch (e: any) {
-      console.error(e);
-      setErr("Não consegui transcrever o áudio. Tenta falar mais perto.");
-      return null;
-    }
-  }
-
-  // Alma helper (Grok)
-  async function askAlma(question: string): Promise<string> {
-    try {
-      const r = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
-      });
-      if (!r.ok) {
-        const t = await r.text().catch(() => "");
-        throw new Error(t || `HTTP ${r.status}`);
-      }
-      const j = (await r.json()) as { answer?: string };
-      return j.answer || "Não consegui obter resposta agora.";
-    } catch (e: any) {
-      console.error(e);
-      return "Tive um problema a contactar o cérebro (Grok).";
-    }
-  }
-
-  // Envio por texto
-  const sendText = useCallback(async () => {
-    const q = input.trim();
-    if (!q) return;
-    setInput("");
-    setMessages((m) => [...m, { role: "user", text: q }]);
-    setIsThinking(true);
-    const a = await askAlma(q);
-    setMessages((m) => [...m, { role: "alma", text: a }]);
-    await speak(a);
-    setIsThinking(false);
-  }, [input, speak]);
-
-  // Tecla Enter envia
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        sendText();
-      }
+    const processor = audioContext.current.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (!recording.current) return;
+      const input = e.inputBuffer.getChannelData(0);
+      bufferData.current.push(new Float32Array(input));
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [sendText]);
 
-  // UI
+    source.connect(processor);
+    processor.connect(audioContext.current.destination);
+
+    mediaProcessor.current = processor;
+    bufferData.current = [];
+    recording.current = true;
+    setList((prev) => [...prev, "🎙️ A gravar..."]);
+  }
+
+  // ⏹️ Parar e processar WAV
+  async function stopRec() {
+    recording.current = false;
+    setLoading(true);
+
+    // Concatenar floats
+    const flat = mergeBuffers(bufferData.current);
+    const wav = encodeWAV(flat, audioContext.current!.sampleRate);
+
+    // criar Blob WAV
+    const audioBlob = new Blob([wav], { type: "audio/wav" });
+
+    // enviar para STT
+    const formData = new FormData();
+    formData.append("file", audioBlob, "audio.wav");
+
+    try {
+      const sttRes = await fetch("/api/stt", { method: "POST", body: formData });
+      const { transcript } = await sttRes.json();
+
+      setList((prev) => [...prev, `👤 Tu: ${transcript}`]);
+
+      // perguntar ao LLM
+      const askRes = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: transcript }),
+      });
+      const { answer } = await askRes.json();
+      setList((prev) => [...prev, `🤖 Alma: ${answer}`]);
+
+      // sintetizar voz
+      const ttsRes = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: answer }),
+      });
+      const audioBuffer = await ttsRes.arrayBuffer();
+      const blob = new Blob([audioBuffer], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.play();
+    } catch (err) {
+      console.error(err);
+      setList((prev) => [...prev, `⚠️ Erro: ${err}`]);
+    }
+
+    setLoading(false);
+  }
+
   return (
-    <div className="min-h-dvh w-full max-w-3xl mx-auto px-4 py-6 flex flex-col gap-4 text-zinc-100 bg-zinc-950">
-      <h1 className="text-xl font-semibold">Alma — voz em tempo quase real</h1>
-
-      <div className="flex gap-2">
-        <button
-          className="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700"
-          onClick={askMic}
-        >
-          Permitir micro
-        </button>
-        <button
-          className={`px-3 py-2 rounded ${
-            recording ? "bg-red-600" : "bg-emerald-700 hover:bg-emerald-600"
-          }`}
-          onMouseDown={startRecording}
-          onMouseUp={stopRecording}
-          onTouchStart={startRecording}
-          onTouchEnd={stopRecording}
-        >
-          {recording ? "A gravar… solta para enviar" : "Manter premido para falar"}
-        </button>
-        <button
-          className="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700"
-          onClick={() => speak("Teste de voz da Alma. 1, 2, 3.")}
-        >
-          Testar voz
-        </button>
-      </div>
-
-      {isThinking && (
-        <div className="text-sm text-zinc-300">A pensar…</div>
-      )}
-
-      {err && (
-        <div className="text-sm text-red-400">⚠️ {err}</div>
-      )}
-
-      <div className="flex flex-col gap-2 border border-zinc-800 rounded p-3 max-h-[50vh] overflow-auto">
-        {messages.map((m, i) => (
-          <div key={i}>
-            <span
-              className={`text-xs mr-2 ${
-                m.role === "user"
-                  ? "text-sky-400"
-                  : m.role === "alma"
-                  ? "text-emerald-400"
-                  : "text-zinc-400"
-              }`}
-            >
-              {m.role.toUpperCase()}
-            </span>
-            <span className="whitespace-pre-wrap">{m.text}</span>
-          </div>
+    <main style={{ padding: 20 }}>
+      <h1>🎤 Alma com WAV</h1>
+      <button onClick={startRec} disabled={recording.current}>Iniciar</button>
+      <button onClick={stopRec} disabled={!recording.current || loading}>
+        Parar & Enviar
+      </button>
+      <div style={{ marginTop: 20 }}>
+        {list.map((m, i) => (
+          <p key={i}>{m}</p>
         ))}
       </div>
-
-      <div className="flex gap-2">
-        <input
-          className="flex-1 px-3 py-2 rounded bg-zinc-900 border border-zinc-800"
-          placeholder="Escreve aqui… (⌘/Ctrl + Enter para enviar)"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-        />
-        <button
-          className="px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700"
-          onClick={sendText}
-        >
-          Enviar
-        </button>
-      </div>
-    </div>
+    </main>
   );
+}
+
+// 🔊 juntar buffers
+function mergeBuffers(buffers: Float32Array[]) {
+  let length = 0;
+  buffers.forEach((b) => (length += b.length));
+  const result = new Float32Array(length);
+  let offset = 0;
+  buffers.forEach((b) => {
+    result.set(b, offset);
+    offset += b.length;
+  });
+  return result;
+}
+
+// 🔊 converter para WAV (PCM 16-bit mono)
+function encodeWAV(samples: Float32Array, sampleRate: number) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true); // Subchunk1Size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(view, 36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  floatTo16BitPCM(view, 44, samples);
+
+  return buffer;
+}
+
+function floatTo16BitPCM(view: DataView, offset: number, input: Float32Array) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, input[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+}
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
 }
