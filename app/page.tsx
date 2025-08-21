@@ -8,17 +8,17 @@ export default function Page() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isHolding, setIsHolding] = useState(false);
+  const [micReady, setMicReady] = useState(false);
+  const [micHint, setMicHint] = useState<string>("");
 
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
 
-  // ---------- utils ----------
   function append(who: Message["who"], text: string) {
     setMessages((m) => [...m, { who, text }]);
   }
 
-  // mantém o mesmo fluxo de TEXTO -> /api/alma -> /api/tts que já estava ok
   async function askAlma(question: string): Promise<string> {
     const r = await fetch("/api/alma", {
       method: "POST",
@@ -47,10 +47,7 @@ export default function Page() {
     try {
       await audio.play();
     } catch {
-      append(
-        "Alma",
-        "⚠️ O navegador bloqueou o áudio automático. Toca no ecrã e tenta de novo."
-      );
+      append("Alma", "⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
     }
     audio.onended = () => URL.revokeObjectURL(url);
   }
@@ -63,18 +60,18 @@ export default function Page() {
     const a = await askAlma(q);
     if (a) {
       append("Alma", a);
-      await playTTS(a); // mantém o comportamento que já funcionava
+      await playTTS(a);
     }
   }
 
-  // ---------- STT (apenas acrescenta o hold) ----------
+  // --------- MIC / STT ----------
   function pickBestMime(): string {
     const cands = [
       "audio/webm;codecs=opus",
       "audio/ogg;codecs=opus",
       "audio/webm",
       "audio/ogg",
-      "audio/mp4", // safari / iOS
+      "audio/mp4", // iOS Safari
     ];
     for (const c of cands) {
       if ((window as any).MediaRecorder?.isTypeSupported?.(c)) return c;
@@ -82,17 +79,25 @@ export default function Page() {
     return "audio/webm";
   }
 
-  async function ensureMic(): Promise<MediaStream> {
-    if (mediaStreamRef.current) return mediaStreamRef.current;
-    const s = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    mediaStreamRef.current = s;
-    return s;
+  async function activateMic() {
+    try {
+      setMicHint("");
+      // tem de ser iniciado por clique — iOS/Safari exige gesto do utilizador
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      mediaStreamRef.current = s;
+      setMicReady(true);
+      setMicHint("🎤 Microfone ativo. Agora mantém o botão para falar.");
+    } catch (e: any) {
+      setMicReady(false);
+      setMicHint("⚠️ Permissão negada. Concede acesso ao micro e tenta de novo.");
+      append("Alma", `⚠️ Erro a ativar micro: ${e?.message || String(e)}`);
+    }
   }
 
   async function sendBlobToSTT(blob: Blob): Promise<string> {
@@ -100,7 +105,7 @@ export default function Page() {
       const res = await fetch("/api/stt", {
         method: "POST",
         headers: { "Content-Type": blob.type || "audio/webm" },
-        body: blob, // envia bruto, sem FormData
+        body: blob,
       });
       const j = await res.json();
       if (!res.ok) {
@@ -117,8 +122,14 @@ export default function Page() {
   }
 
   async function startHold() {
+    // se o utilizador não clicou "Ativar microfone" antes, aborta — evita prompt a meio do hold
+    if (!micReady || !mediaStreamRef.current) {
+      setMicHint("⚠️ Primeiro clica em 'Ativar microfone'. Depois mantém para falar.");
+      return;
+    }
+
     try {
-      const stream = await ensureMic();
+      const stream = mediaStreamRef.current!;
       const mimeType = pickBestMime();
 
       chunksRef.current = [];
@@ -150,7 +161,7 @@ export default function Page() {
       rec.start(250);
       setIsHolding(true);
     } catch (e: any) {
-      append("Alma", `⚠️ Erro a iniciar microfone: ${e?.message || String(e)}`);
+      append("Alma", `⚠️ Erro a iniciar gravação: ${e?.message || String(e)}`);
       setIsHolding(false);
     }
   }
@@ -164,10 +175,23 @@ export default function Page() {
     }
   }
 
-  // ---------- UI simples ----------
+  // --------- UI ----------
   return (
     <main className="max-w-xl mx-auto p-4 space-y-4">
       <h1 className="text-xl font-semibold">Alma — voz & texto</h1>
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={activateMic}
+          className={`px-3 py-2 rounded ${
+            micReady ? "bg-emerald-600" : "bg-zinc-700"
+          } text-white`}
+          aria-pressed={micReady}
+        >
+          {micReady ? "🎤 Microfone Ativo" : "Ativar microfone"}
+        </button>
+        {micHint && <span className="text-sm opacity-80">{micHint}</span>}
+      </div>
 
       <div className="border rounded p-2 h-64 overflow-y-auto bg-white/5">
         {messages.map((m, i) => (
