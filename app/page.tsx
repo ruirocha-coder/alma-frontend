@@ -1,303 +1,228 @@
-// app/page.tsx
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
-type Msg = { role: "user" | "alma"; text: string };
+/** ======================
+ *  Helpers (STT)
+ *  ====================== */
+function pickBestMime(): string {
+  if (typeof window === "undefined") return "audio/webm";
+  if (window.MediaRecorder?.isTypeSupported?.("audio/webm;codecs=opus"))
+    return "audio/webm;codecs=opus";
+  if (window.MediaRecorder?.isTypeSupported?.("audio/webm"))
+    return "audio/webm";
+  // Safari / iPad
+  if (window.MediaRecorder?.isTypeSupported?.("audio/mp4")) return "audio/mp4";
+  return "audio/webm";
+}
 
+async function recordAndTranscribe(lang = "pt-PT"): Promise<string> {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const mime = pickBestMime();
+  const rec = new MediaRecorder(stream, { mimeType: mime });
+
+  const chunks: BlobPart[] = [];
+  rec.ondataavailable = (e) => {
+    if (e.data?.size) chunks.push(e.data);
+  };
+
+  // grava ~2.5s — ajusta se quiseres frases mais longas
+  const DURATION_MS = 2500;
+
+  await new Promise<void>((resolve) => {
+    rec.onstop = () => resolve();
+    rec.start();
+    setTimeout(() => rec.stop(), DURATION_MS);
+  });
+
+  // fecha micro
+  stream.getTracks().forEach((t) => t.stop());
+
+  const blob = new Blob(chunks, { type: mime });
+  const form = new FormData();
+  form.append("file", blob, mime.startsWith("audio/mp4") ? "clip.m4a" : "clip.webm");
+  form.append("mime", blob.type);
+  form.append("lang", lang);
+
+  const r = await fetch("/api/stt", { method: "POST", body: form });
+  const j = await r.json();
+
+  if (!r.ok) {
+    throw new Error(j?.detail || j?.error || "STT falhou");
+  }
+  return j.text || "";
+}
+
+/** ======================
+ *  Helpers (TTS)
+ *  ====================== */
+async function speakText(text: string, audioEl: HTMLAudioElement) {
+  // Este /api/tts deve aceitar { text } e devolver áudio
+  const r = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+
+  // Aceita dois formatos:
+  // 1) binary audio (audio/mpeg, audio/wav, etc)
+  // 2) JSON { url: "https://..." }
+  const ctype = r.headers.get("Content-Type") || "";
+
+  if (!r.ok) {
+    const err = await r.text();
+    throw new Error(`TTS error: ${r.status} ${err}`);
+  }
+
+  if (ctype.includes("application/json")) {
+    const j = await r.json();
+    if (!j?.url) throw new Error("TTS: resposta sem URL");
+    audioEl.src = j.url;
+  } else {
+    const blob = await r.blob();
+    audioEl.src = URL.createObjectURL(blob);
+  }
+
+  await audioEl.play().catch(() => {
+    // Em alguns browsers pode exigir interação; o botão já conta como interação.
+  });
+}
+
+/** ======================
+ *  Página
+ *  ====================== */
 export default function Page() {
-  const [msgs, setMsgs] = useState<Msg[]>([]);
-  const [typing, setTyping] = useState("");
-  const [isRecording, setIsRecording] = useState(false);
-  const [isThinking, setIsThinking] = useState(false);
-  const [autoVoice, setAutoVoice] = useState(true);
+  const [you, setYou] = useState<string>("");            // texto dito por ti (via STT ou input)
+  const [alma, setAlma] = useState<string>("");          // resposta da Alma
+  const [loading, setLoading] = useState<boolean>(false);
+  const [err, setErr] = useState<string>("");
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [typing, setTyping] = useState<string>("");      // input manual opcional
+  const audioRef = useRef<HTMLAudioElement>(null);
 
-  // util: acrescenta mensagem ao histórico
-  const pushMsg = (m: Msg) => setMsgs((prev) => [...prev, m]);
-
-  // envia texto à Alma e opcionalmente fala a resposta
-  const askAlma = async (text: string) => {
-    if (!text.trim()) return;
-    pushMsg({ role: "user", text });
-    setIsThinking(true);
-    try {
-      // 1) pergunta à Alma
-      const r = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: text }),
-      });
-      const j = await r.json();
-      const answer = j.answer || "Sem resposta.";
-      pushMsg({ role: "alma", text: answer });
-
-      // 2) TTS (se ligado)
-      if (autoVoice) {
-        const r2 = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: answer,
-            // se a tua rota /api/tts aceitar language/voice, podes enviar aqui
-          }),
-        });
-
-        if (!r2.ok) {
-          const errTxt = await r2.text();
-          pushMsg({
-            role: "alma",
-            text: `Erro no TTS: ${r2.status} ${errTxt.slice(0, 200)}`,
-          });
-        } else {
-          const blob = await r2.blob();
-          const url = URL.createObjectURL(blob);
-          if (!audioRef.current) {
-            audioRef.current = new Audio();
-          }
-          audioRef.current.src = url;
-          audioRef.current.play().catch(() => {
-            // se o autoplay falhar (iOS), mostramos uma dica
-            pushMsg({
-              role: "alma",
-              text:
-                "🔈 Toque no botão ▶️ para ouvir (o navegador bloqueou o autoplay).",
-            });
-          });
-        }
-      }
-    } catch (e: any) {
-      pushMsg({
-        role: "alma",
-        text: "Erro ao contactar a Alma: " + (e?.message || String(e)),
-      });
-    } finally {
-      setIsThinking(false);
-    }
-  };
-
-  // gravação: iniciar
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      const preferredTypes = [
-        "audio/webm;codecs=opus",
-        "audio/webm",
-        "audio/mp4",
-        "audio/mpeg",
-      ];
-      let mimeType = "";
-      for (const t of preferredTypes) {
-        if (MediaRecorder.isTypeSupported(t)) {
-          mimeType = t;
-          break;
-        }
-      }
-
-      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      mediaRecorderRef.current = mr;
-      chunksRef.current = [];
-
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      mr.start();
-      setIsRecording(true);
-    } catch (e: any) {
-      pushMsg({
-        role: "alma",
-        text: "Não consegui aceder ao microfone: " + (e?.message || String(e)),
-      });
-    }
-  };
-
-  // gravação: parar → enviar para STT → perguntar à Alma
-  const stopRecording = async () => {
-    if (!mediaRecorderRef.current) return;
-    const mr = mediaRecorderRef.current;
-
-    await new Promise<void>((resolve) => {
-      mr.onstop = () => resolve();
-      mr.stop();
+  async function askAlma(question: string) {
+    const r = await fetch("/api/alma", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
     });
-    setIsRecording(false);
 
-    // cria blob com o tipo preferido (Deepgram aceita webm/mp4/mp3/wav)
-    const blobType =
-      mr.mimeType ||
-      (chunksRef.current[0]?.type || "audio/webm"); // fallback sensato
-    const blob = new Blob(chunksRef.current, { type: blobType });
-    chunksRef.current = [];
+    const j = await r.json();
+    if (!r.ok) {
+      throw new Error(j?.answer || "Erro no /api/alma");
+    }
+    return j.answer || "";
+  }
+
+  async function handleVoiceFlow() {
+    setErr("");
+    setLoading(true);
+    setAlma("");
 
     try {
-      const form = new FormData();
-      form.append("file", blob, `recording.${blobType.split("/")[1] || "webm"}`);
+      // 1) STT
+      const said = await recordAndTranscribe("pt-PT");
+      setYou(said || "(sem texto)");
 
-      const r = await fetch("/api/stt", {
-        method: "POST",
-        body: form,
-      });
-
-      const j = await r.json();
-      const transcript = j.text || j.transcript || "";
-
-      if (!transcript) {
-        pushMsg({
-          role: "alma",
-          text:
-            "Não consegui transcrever o áudio. Tenta falar um pouco mais perto do microfone.",
-        });
+      if (!said) {
+        setLoading(false);
         return;
       }
 
-      // mostra a transcrição como se fosse a tua mensagem
-      pushMsg({ role: "user", text: transcript });
+      // 2) Alma (Grok via teu server)
+      const response = await askAlma(said);
+      setAlma(response || "");
 
-      // pergunta à Alma
-      await askAlma(transcript);
-    } catch (e: any) {
-      pushMsg({
-        role: "alma",
-        text: "Erro no STT: " + (e?.message || String(e)),
-      });
-    }
-  };
-
-  const handleSend = async () => {
-    const t = typing.trim();
-    setTyping("");
-    if (!t) return;
-    await askAlma(t);
-  };
-
-  // atalhos: Enter para enviar
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        const t = (document.getElementById("msgbox") as HTMLTextAreaElement)
-          ?.value;
-        if (t) handleSend();
+      // 3) TTS
+      if (response && audioRef.current) {
+        await speakText(response, audioRef.current);
       }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [typing]);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleTextFlow() {
+    setErr("");
+    setLoading(true);
+    setAlma("");
+    setYou(typing);
+
+    try {
+      if (!typing.trim()) {
+        setLoading(false);
+        return;
+      }
+      const response = await askAlma(typing.trim());
+      setAlma(response || "");
+
+      if (response && audioRef.current) {
+        await speakText(response, audioRef.current);
+      }
+      setTyping("");
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center p-4">
-      <div className="w-full max-w-3xl flex flex-col gap-4">
-        <header className="flex items-center justify-between">
-          <h1 className="text-xl font-semibold">🧠 Alma — voz & texto</h1>
-          <div className="flex items-center gap-3 text-sm">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={autoVoice}
-                onChange={(e) => setAutoVoice(e.target.checked)}
-              />
-              Falar resposta
-            </label>
-          </div>
-        </header>
+    <main className="min-h-dvh bg-zinc-950 text-zinc-100 p-4 flex items-center justify-center">
+      <div className="w-full max-w-3xl space-y-6">
+        <h1 className="text-2xl font-semibold">🎤 Alma – voz & chat (STT → Alma → TTS)</h1>
 
-        {/* histórico */}
-        <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-3 h-[60vh] overflow-auto">
-          {msgs.length === 0 && (
-            <p className="text-zinc-400">
-              Fala comigo — grava áudio 🎙️ ou escreve uma pergunta 👇
-            </p>
-          )}
-          <ul className="space-y-3">
-            {msgs.map((m, i) => (
-              <li
-                key={i}
-                className={
-                  m.role === "user"
-                    ? "text-right"
-                    : "text-left"
-                }
-              >
-                <div
-                  className={
-                    "inline-block px-3 py-2 rounded-lg " +
-                    (m.role === "user"
-                      ? "bg-blue-600"
-                      : "bg-zinc-800")
-                  }
-                >
-                  <span className="text-sm opacity-80 mr-2">
-                    {m.role === "user" ? "Tu" : "Alma"}
-                    {": "}
-                  </span>
-                  <span className="whitespace-pre-wrap">{m.text}</span>
-                </div>
-              </li>
-            ))}
-            {isThinking && (
-              <li className="text-left">
-                <div className="inline-block px-3 py-2 rounded-lg bg-zinc-800 animate-pulse">
-                  A pensar…
-                </div>
-              </li>
-            )}
-          </ul>
-        </section>
+        <div className="flex gap-3">
+          <button
+            onClick={handleVoiceFlow}
+            disabled={loading}
+            className="rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-4 py-2"
+          >
+            {loading ? "A processar..." : "Falar"}
+          </button>
 
-        {/* input + gravação */}
-        <section className="flex flex-col gap-2">
-          <div className="flex gap-2">
-            <textarea
-              id="msgbox"
-              value={typing}
-              onChange={(e) => setTyping(e.target.value)}
-              placeholder="Escreve aqui… (Cmd/Ctrl+Enter para enviar)"
-              className="flex-1 rounded-lg border border-zinc-800 bg-zinc-900 p-2 outline-none"
-              rows={2}
-            />
-            <button
-              onClick={handleSend}
-              className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500"
-              disabled={!typing.trim() || isThinking}
-            >
-              Enviar
-            </button>
+          <input
+            value={typing}
+            onChange={(e) => setTyping(e.target.value)}
+            placeholder="ou escreve aqui e carrega em Enviar…"
+            className="flex-1 rounded-md bg-zinc-800 px-3 py-2 outline-none"
+          />
+          <button
+            onClick={handleTextFlow}
+            disabled={loading}
+            className="rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 px-4 py-2"
+          >
+            Enviar
+          </button>
+        </div>
+
+        <div className="rounded-lg bg-zinc-900 p-4 space-y-3">
+          <div>
+            <div className="text-sm text-zinc-400">Tu disseste</div>
+            <div className="mt-1 whitespace-pre-wrap">{you || "—"}</div>
           </div>
 
-          <div className="flex items-center gap-2">
-            {!isRecording ? (
-              <button
-                onClick={startRecording}
-                className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500"
-                disabled={isThinking}
-              >
-                🎙️ Gravar
-              </button>
-            ) : (
-              <button
-                onClick={stopRecording}
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500"
-              >
-                ⏹️ Parar
-              </button>
-            )}
+          <div className="border-t border-zinc-800 my-2" />
 
-            <button
-              onClick={() => {
-                if (!audioRef.current) audioRef.current = new Audio();
-                audioRef.current?.play().catch(() => {});
-              }}
-              className="px-3 py-2 rounded-lg border border-zinc-700"
-              title="Reproduzir última resposta"
-            >
-              ▶️ Ouvir última
-            </button>
+          <div>
+            <div className="text-sm text-zinc-400">Alma</div>
+            <div className="mt-1 whitespace-pre-wrap">{alma || "—"}</div>
           </div>
-        </section>
+
+          <audio ref={audioRef} hidden />
+        </div>
+
+        {!!err && (
+          <div className="rounded-md bg-red-600/15 text-red-300 p-3">
+            Alma: {err}
+          </div>
+        )}
+
+        <p className="text-xs text-zinc-500">
+          Dica: se o iPad/Safari não transcrever, fala ~3s com o micro perto.
+        </p>
       </div>
     </main>
   );
