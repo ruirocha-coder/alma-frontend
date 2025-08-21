@@ -1,52 +1,74 @@
-// app/api/stt/route.ts
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+export const runtime = "nodejs";
 
-// Deepgram: modelo e opções afinadas para PT
-const DG_ENDPOINT =
-  "https://api.deepgram.com/v1/listen?model=nova-2-general&language=pt-PT&smart_format=true&punctuate=true&diarize=false";
-
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
+    const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
     if (!DEEPGRAM_API_KEY) {
       return NextResponse.json(
-        { transcript: "", error: "DEEPGRAM_API_KEY em falta" },
+        { transcript: "", error: "Falta DEEPGRAM_API_KEY" },
         { status: 500 }
       );
     }
 
-    // Recebe o áudio bruto do browser (MediaRecorder -> webm/opus)
-    const audioBuf = Buffer.from(await req.arrayBuffer());
+    // 1) Recebe o FormData do browser (audio + mime)
+    const form = await req.formData();
+    const file = form.get("audio") as File | null;
+    const mimeFromForm = (form.get("mime") as string) || "";
 
-    const dgRes = await fetch(DG_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${DEEPGRAM_API_KEY}`,
-        // tenta primeiro webm/opus; Deepgram detecta bem
-        "Content-Type": "audio/webm",
-        "Accept": "application/json",
-      },
-      body: audioBuf,
-    });
-
-    if (!dgRes.ok) {
-      const txt = await dgRes.text();
+    if (!file) {
       return NextResponse.json(
-        { transcript: "", error: `Deepgram ${dgRes.status}: ${txt}` },
-        { status: 502 }
+        { transcript: "", error: "Sem ficheiro 'audio' no form-data" },
+        { status: 400 }
       );
     }
 
-    const json = await dgRes.json();
-    // caminho típico do transcript
+    // 2) Extrai bytes e MIME
+    const mime =
+      mimeFromForm ||
+      (file.type && typeof file.type === "string" ? file.type : "") ||
+      "audio/webm";
+
+    const buf = Buffer.from(await file.arrayBuffer());
+
+    if (!buf.length) {
+      return NextResponse.json(
+        { transcript: "", error: "Áudio vazio" },
+        { status: 400 }
+      );
+    }
+
+    // 3) Envia BINÁRIO CRU para a Deepgram
+    //    Ajusta a língua se precisares (pt, pt-BR, etc.)
+    const url =
+      "https://api.deepgram.com/v1/listen?smart_format=true&language=pt";
+    const dg = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${DEEPGRAM_API_KEY}`,
+        "Content-Type": mime, // ex: audio/webm;codecs=opus OU audio/mp4
+      },
+      body: buf,
+    });
+
+    const text = await dg.text();
+
+    if (!dg.ok) {
+      return NextResponse.json(
+        { transcript: "", error: `Deepgram ${dg.status}: ${text}` },
+        { status: dg.status }
+      );
+    }
+
+    const json = JSON.parse(text);
     const transcript =
       json?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
 
-    return NextResponse.json({ transcript });
-  } catch (err: any) {
+    return NextResponse.json({ text: transcript });
+  } catch (e: any) {
     return NextResponse.json(
-      { transcript: "", error: err?.message || String(err) },
+      { transcript: "", error: e?.message || String(e) },
       { status: 500 }
     );
   }
