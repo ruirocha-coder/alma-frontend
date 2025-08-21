@@ -1,138 +1,63 @@
 // app/api/stt/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 
-const DG_ENDPOINT = "https://api.deepgram.com/v1/listen";
+export const runtime = "nodejs"; // força Node (não Edge), mais seguro para multipart
 
-/**
- * Notas:
- * - Aceita tanto "audio" como "file" no FormData (para compat. com vários clients)
- * - Suporta webm/opus, m4a/aac, wav (Deepgram aceita todos)
- * - Usa modelo 'nova-2' e idioma pt (podes mudar via DEEPGRAM_LANGUAGE)
- */
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    const DEBUG = process.env.STT_DEBUG === "1";
-    const DG_KEY = process.env.DEEPGRAM_API_KEY;
-    if (!DG_KEY) {
-      return NextResponse.json(
-        { transcript: "", error: "DEEPGRAM_API_KEY em falta" },
-        { status: 500 }
-      );
-    }
-
     const form = await req.formData();
-    const file = (form.get("audio") || form.get("file")) as File | null;
+    const file = form.get("file");
 
-    if (!file) {
-      return NextResponse.json(
-        { transcript: "", error: "Nenhum ficheiro recebido" },
-        { status: 400 }
-      );
+    if (!file || !(file instanceof Blob)) {
+      return new Response(JSON.stringify({ transcript: "", error: "Nenhum ficheiro recebido" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    // Limite defensivo de tamanho (ex.: 25MB)
-    if (file.size > 25 * 1024 * 1024) {
-      return NextResponse.json(
-        { transcript: "", error: "Ficheiro demasiado grande (>25MB)" },
-        { status: 413 }
-      );
+    const apiKey = process.env.DEEPGRAM_API_KEY;
+    if (!apiKey) {
+      return new Response(JSON.stringify({ transcript: "", error: "DEEPGRAM_API_KEY não definida" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
-    const lang = (process.env.DEEPGRAM_LANGUAGE || "pt").trim();
-    const contentType =
-      file.type ||
-      // fallback por extensão do nome
-      (file.name.endsWith(".m4a")
-        ? "audio/mp4"
-        : file.name.endsWith(".wav")
-        ? "audio/wav"
-        : "audio/webm");
+    // O MediaRecorder do browser está a enviar audio/webm;codecs=opus
+    const arrayBuffer = await file.arrayBuffer();
 
-    // Log útil para diagnosticar codecs/containers
-    if (DEBUG) {
-      console.log(
-        "[/api/stt] name=%s type=%s size=%d",
-        file.name,
-        contentType,
-        file.size
-      );
-    }
-
-    // Buffer binário do áudio
-    const bodyBuf = Buffer.from(await file.arrayBuffer());
-
-    // Query params recomendados p/ Deepgram (pre-gravado)
-    // - model=nova-2 (preciso & rápido)
-    // - smart_format & punctuate para melhorar legibilidade
-    const url = new URL(DG_ENDPOINT);
-    url.searchParams.set("model", "nova-2");
-    url.searchParams.set("language", lang); // ex.: "pt" (Deepgram usa "pt" p/ PT-BR/PT-PT auto)
-    url.searchParams.set("smart_format", "true");
-    url.searchParams.set("punctuate", "true");
-
-    // Timeout defensivo (10s). AbortController é suportado no runtime do Next.
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 10000);
-
-    const r = await fetch(url.toString(), {
+    const dg = await fetch("https://api.deepgram.com/v1/listen?model=nova-2-general&language=pt", {
       method: "POST",
       headers: {
-        Authorization: `Token ${DG_KEY}`,
-        "Content-Type": contentType,
+        Authorization: `Token ${apiKey}`,
+        "Content-Type": "audio/webm", // importante para evitar 400 "unsupported data"
       },
-      body: bodyBuf,
-      signal: controller.signal,
-    }).finally(() => clearTimeout(t));
+      body: Buffer.from(arrayBuffer),
+    });
 
-    const j = await r.json().catch(() => ({}));
-
-    if (!r.ok) {
-      if (DEBUG) {
-        console.error("[/api/stt] Deepgram error %d: %s", r.status, JSON.stringify(j));
-      }
-      return NextResponse.json(
-        {
+    if (!dg.ok) {
+      const errTxt = await dg.text();
+      return new Response(
+        JSON.stringify({
           transcript: "",
-          error: `Deepgram ${r.status}: ${JSON.stringify(j)}`,
-        },
-        { status: 400 }
+          error: `Deepgram ${dg.status}: ${errTxt}`,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Extrai a melhor alternativa
+    const data = await dg.json();
     const transcript =
-      j?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+      data?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim?.() || "";
 
-    if (!transcript) {
-      return NextResponse.json(
-        { transcript: "", error: "Sem texto reconhecido" },
-        { status: 200 }
-      );
-    }
-
-    if (DEBUG) {
-      console.log("[/api/stt] OK transcript:", transcript);
-    }
-
-    return NextResponse.json({ transcript }, { status: 200 });
+    return new Response(JSON.stringify({ transcript, error: null }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
   } catch (e: any) {
-    const msg = e?.name === "AbortError" ? "Timeout na requisição ao Deepgram" : e?.message || String(e);
-    console.error("[/api/stt] Exception:", msg);
-    return NextResponse.json({ transcript: "", error: msg }, { status: 500 });
+    return new Response(
+      JSON.stringify({ transcript: "", error: e?.message || String(e) }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
-}
-
-// (Opcional) Permitir preflight CORS se vais chamar este endpoint de outro domínio/app
-export function OPTIONS() {
-  return NextResponse.json(
-    {},
-    {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      },
-    }
-  );
 }
