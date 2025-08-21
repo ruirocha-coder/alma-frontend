@@ -1,60 +1,53 @@
-import { NextRequest, NextResponse } from "next/server";
+// app/api/tts/route.ts
+import { NextRequest } from "next/server";
 
 export async function POST(req: NextRequest) {
   try {
     const { text } = await req.json();
-
-    if (!text) {
-      return NextResponse.json({ error: "Texto vazio" }, { status: 400 });
+    if (!text || !text.trim()) {
+      return new Response("Missing text", { status: 400 });
     }
 
-    const voiceId = process.env.ELEVENLABS_VOICE_ID;
     const apiKey = process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || "Rachel"; // mete o teu VOICE_ID
+    const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
 
-    if (!voiceId || !apiKey) {
-      return NextResponse.json(
-        { error: "Configuração TTS em falta" },
-        { status: 500 }
-      );
+    if (!apiKey) {
+      return new Response("ELEVENLABS_API_KEY not set", { status: 500 });
     }
 
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+    const r = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
       {
         method: "POST",
         headers: {
           "xi-api-key": apiKey,
           "Content-Type": "application/json",
+          Accept: "audio/mpeg",
         },
         body: JSON.stringify({
+          model_id: modelId,
           text,
-          model_id: "eleven_multilingual_v2", // 👈 modelo mais robusto
-          voice_settings: {
-            stability: 0.6,
-            similarity_boost: 0.8,
-          },
+          // PT-PT melhora “s”/“z” e prosódia
+          voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0, use_speaker_boost: true },
         }),
       }
     );
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return NextResponse.json(
-        { error: `TTS error: ${response.status} ${errText}` },
-        { status: response.status }
-      );
+    if (!r.ok) {
+      const errTxt = await r.text();
+      return new Response(`TTS error: ${r.status} ${errTxt}`, { status: 502 });
     }
 
-    const audioBuffer = await response.arrayBuffer();
-
-    return new NextResponse(audioBuffer, {
+    // Stream MP3 de volta
+    return new Response(r.body, {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
-        "Content-Length": audioBuffer.byteLength.toString(),
+        "Cache-Control": "no-store",
       },
     });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
+  } catch (e: any) {
+    return new Response(`TTS exception: ${e?.message || e}`, { status: 500 });
   }
 }
