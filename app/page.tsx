@@ -15,6 +15,8 @@ import React, { useEffect, useRef, useState } from "react";
  *  - POST /api/tts  -> JSON { text: string }      -> retorna audio/mpeg (ArrayBuffer)
  */
 
+type ChatEntry = { role: "tu" | "alma"; text: string };
+
 export default function Page() {
   // --- UI state
   const [status, setStatus] = useState<string>("Pronto");
@@ -26,6 +28,12 @@ export default function Page() {
   // entrada por texto
   const [typed, setTyped] = useState("");
 
+  // histórico (para copiar)
+  const [history, setHistory] = useState<ChatEntry[]>([]);
+
+  // estado da fala (para mostrar "Parar voz")
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
   // --- Audio / Recorder refs
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -33,7 +41,7 @@ export default function Page() {
 
   // Audio element para TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
-  const lastObjectUrlRef = useRef<string | null>(null);
+  const ttsObjectUrlRef = useRef<string | null>(null);
 
   // cria o <audio> de TTS uma vez
   useEffect(() => {
@@ -43,17 +51,14 @@ export default function Page() {
     (a as any).playsInline = true;
     a.autoplay = false;
     a.preload = "auto";
-    a.volume = 1;
-    a.muted = false;
 
-    // liberta o objectURL quando o áudio terminar
+    // quando o áudio termina, libertar estado/URL
     a.addEventListener("ended", () => {
-      try {
-        if (lastObjectUrlRef.current) {
-          URL.revokeObjectURL(lastObjectUrlRef.current);
-          lastObjectUrlRef.current = null;
-        }
-      } catch {}
+      setIsSpeaking(false);
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
     });
 
     ttsAudioRef.current = a;
@@ -63,7 +68,6 @@ export default function Page() {
       if (!ttsAudioRef.current) return;
       try {
         ttsAudioRef.current.muted = true;
-        // tentativa de play para desbloquear o contexto
         ttsAudioRef.current
           .play()
           .then(() => {
@@ -82,12 +86,11 @@ export default function Page() {
     return () => {
       document.removeEventListener("click", unlockAudio);
       document.removeEventListener("touchstart", unlockAudio);
-      try {
-        if (lastObjectUrlRef.current) {
-          URL.revokeObjectURL(lastObjectUrlRef.current);
-          lastObjectUrlRef.current = null;
-        }
-      } catch {}
+      a.pause();
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
     };
   }, []);
 
@@ -129,12 +132,14 @@ export default function Page() {
       setStatus("🎙️ A gravar…");
       chunksRef.current = [];
 
-      const mime =
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "audio/mp4"; // fallback para Safari
+      // 🔧 CORREÇÃO: força um mime estável em todas as gravações
+      let mime = "audio/webm;codecs=opus";
+      if (!MediaRecorder.isTypeSupported(mime)) {
+        mime = "audio/webm";
+      }
+      if (!MediaRecorder.isTypeSupported(mime)) {
+        mime = "audio/mp4"; // fallback (Safari)
+      }
 
       const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
       mediaRecorderRef.current = mr;
@@ -145,7 +150,7 @@ export default function Page() {
         }
       };
       mr.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: mr.mimeType });
+        const blob = new Blob(chunksRef.current, { type: mime }); // usa sempre o mime válido
         await handleTranscribeAndAnswer(blob);
       };
 
@@ -182,6 +187,11 @@ export default function Page() {
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
       setTranscript(said);
+
+      if (said) {
+        setHistory((h) => [...h, { role: "tu", text: said }]);
+      }
+
       if (!said) {
         setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar um pouco mais perto.");
         return;
@@ -202,6 +212,8 @@ export default function Page() {
       const almaJson = (await almaResp.json()) as { answer?: string };
       const out = (almaJson.answer || "").trim();
       setAnswer(out);
+      if (out) setHistory((h) => [...h, { role: "alma", text: out }]);
+
       setStatus("🔊 A falar…");
 
       // 3) TTS
@@ -212,13 +224,30 @@ export default function Page() {
     }
   }
 
+  // interromper voz
+  function stopSpeaking() {
+    const audio = ttsAudioRef.current;
+    if (!audio) return;
+    try {
+      audio.pause();
+      audio.currentTime = 0;
+      // limpar src e libertar URL
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
+      audio.src = "";
+    } catch {}
+    setIsSpeaking(false);
+    setStatus("Pronto");
+  }
+
   async function speak(text: string) {
     if (!text) return;
     try {
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // se o backend /api/tts aceitar voiceId/model, podes adicionar aqui
         body: JSON.stringify({ text }),
       });
       if (!r.ok) {
@@ -230,13 +259,11 @@ export default function Page() {
       const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
 
-      // limpa o URL anterior (se existir)
-      try {
-        if (lastObjectUrlRef.current) {
-          URL.revokeObjectURL(lastObjectUrlRef.current);
-        }
-      } catch {}
-      lastObjectUrlRef.current = url;
+      // revoga URL anterior se existir
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+      }
+      ttsObjectUrlRef.current = url;
 
       const audio = ttsAudioRef.current;
       if (!audio) {
@@ -245,21 +272,17 @@ export default function Page() {
       }
 
       audio.src = url;
-      audio.muted = false;
-      audio.volume = 1;
-
-      // força o iOS a preparar a fonte nova antes de play
-      try {
-        audio.load();
-      } catch {}
+      setIsSpeaking(true);
 
       try {
         await audio.play();
       } catch (e: any) {
         setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
+        setIsSpeaking(false);
       }
     } catch (e: any) {
       setStatus("⚠️ Erro no TTS: " + (e?.message || e));
+      setIsSpeaking(false);
     }
   }
 
@@ -269,6 +292,7 @@ export default function Page() {
     setStatus("🧠 A perguntar à Alma…");
     setTranscript(q);
     setAnswer("");
+    setHistory((h) => [...h, { role: "tu", text: q }]);
 
     try {
       const almaResp = await fetch("/api/alma", {
@@ -284,6 +308,8 @@ export default function Page() {
       const almaJson = (await almaResp.json()) as { answer?: string };
       const out = (almaJson.answer || "").trim();
       setAnswer(out);
+      if (out) setHistory((h) => [...h, { role: "alma", text: out }]);
+
       setStatus("🔊 A falar…");
       await speak(out);
       setStatus("Pronto");
@@ -301,6 +327,20 @@ export default function Page() {
   function onHoldEnd(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     stopHold();
+  }
+
+  // copiar histórico
+  async function copyHistory() {
+    const text = history
+      .map((m) => (m.role === "tu" ? "Tu: " : "Alma: ") + m.text)
+      .join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text || "");
+      setStatus("📋 Conversa copiada!");
+      setTimeout(() => setStatus("Pronto"), 1500);
+    } catch {
+      setStatus("⚠️ Não consegui copiar. Seleciona e copia manualmente.");
+    }
   }
 
   return (
@@ -346,6 +386,34 @@ export default function Page() {
         >
           {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
         </button>
+
+        {isSpeaking && (
+          <button
+            onClick={stopSpeaking}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 8,
+              border: "1px solid #444",
+              background: "#552222",
+              color: "#fff",
+            }}
+          >
+            ⏹️ Parar voz
+          </button>
+        )}
+
+        <button
+          onClick={copyHistory}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #444",
+            background: "#2b2bff",
+            color: "#fff",
+          }}
+        >
+          📋 Copiar conversa
+        </button>
       </div>
 
       {/* Entrada por texto */}
@@ -380,13 +448,14 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Conversa simples */}
+      {/* Conversa simples (última troca) */}
       <div
         style={{
           border: "1px solid #333",
           borderRadius: 12,
           padding: 12,
           background: "#0b0b0b",
+          marginBottom: 16,
         }}
       >
         <div style={{ marginBottom: 8 }}>
@@ -396,6 +465,39 @@ export default function Page() {
         <div>
           <div style={{ fontWeight: 600, color: "#aaa" }}>Alma:</div>
           <div style={{ whiteSpace: "pre-wrap" }}>{answer || "—"}</div>
+        </div>
+      </div>
+
+      {/* Histórico completo */}
+      <div
+        style={{
+          border: "1px dashed #333",
+          borderRadius: 12,
+          padding: 12,
+          background: "#0b0b0b",
+        }}
+      >
+        <div style={{ fontWeight: 600, color: "#aaa", marginBottom: 8 }}>
+          Histórico da conversa
+        </div>
+        <div
+          style={{
+            maxHeight: 240,
+            overflowY: "auto",
+            display: "grid",
+            gap: 8,
+          }}
+        >
+          {history.length === 0 ? (
+            <div style={{ opacity: 0.6 }}>— sem mensagens —</div>
+          ) : (
+            history.map((m, i) => (
+              <div key={i}>
+                <span style={{ color: "#888" }}>{m.role === "tu" ? "Tu" : "Alma"}:</span>{" "}
+                <span style={{ whiteSpace: "pre-wrap" }}>{m.text}</span>
+              </div>
+            ))
+          )}
         </div>
       </div>
     </main>
