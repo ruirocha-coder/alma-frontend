@@ -33,6 +33,7 @@ export default function Page() {
 
   // Audio element para TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const lastObjectUrlRef = useRef<string | null>(null);
 
   // cria o <audio> de TTS uma vez
   useEffect(() => {
@@ -42,6 +43,19 @@ export default function Page() {
     (a as any).playsInline = true;
     a.autoplay = false;
     a.preload = "auto";
+    a.volume = 1;
+    a.muted = false;
+
+    // liberta o objectURL quando o áudio terminar
+    a.addEventListener("ended", () => {
+      try {
+        if (lastObjectUrlRef.current) {
+          URL.revokeObjectURL(lastObjectUrlRef.current);
+          lastObjectUrlRef.current = null;
+        }
+      } catch {}
+    });
+
     ttsAudioRef.current = a;
 
     // desbloqueio de áudio no iOS: preparar um pequeno som silencioso on user-gesture
@@ -49,6 +63,7 @@ export default function Page() {
       if (!ttsAudioRef.current) return;
       try {
         ttsAudioRef.current.muted = true;
+        // tentativa de play para desbloquear o contexto
         ttsAudioRef.current
           .play()
           .then(() => {
@@ -67,6 +82,12 @@ export default function Page() {
     return () => {
       document.removeEventListener("click", unlockAudio);
       document.removeEventListener("touchstart", unlockAudio);
+      try {
+        if (lastObjectUrlRef.current) {
+          URL.revokeObjectURL(lastObjectUrlRef.current);
+          lastObjectUrlRef.current = null;
+        }
+      } catch {}
     };
   }, []);
 
@@ -75,6 +96,7 @@ export default function Page() {
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
+      // áudio apenas, sem echoCancellation para não distorcer (podes ligar se quiseres)
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -95,6 +117,7 @@ export default function Page() {
 
   function startHold() {
     if (!isArmed) {
+      // primeira interação: ativar micro
       requestMic();
       return;
     }
@@ -189,13 +212,13 @@ export default function Page() {
     }
   }
 
-  // ✅ Apenas esta função foi reforçada para tocar áudio de forma fiável (Safari/Chrome)
   async function speak(text: string) {
     if (!text) return;
     try {
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        // se o backend /api/tts aceitar voiceId/model, podes adicionar aqui
         body: JSON.stringify({ text }),
       });
       if (!r.ok) {
@@ -203,53 +226,38 @@ export default function Page() {
         setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
         return;
       }
-
-      // tenta respeitar o content-type devolvido pelo backend (ex.: audio/mpeg, audio/mp3)
-      const ct = r.headers.get("Content-Type") || "audio/mpeg";
       const ab = await r.arrayBuffer();
-      const blob = new Blob([ab], { type: ct });
+      const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
+
+      // limpa o URL anterior (se existir)
+      try {
+        if (lastObjectUrlRef.current) {
+          URL.revokeObjectURL(lastObjectUrlRef.current);
+        }
+      } catch {}
+      lastObjectUrlRef.current = url;
 
       const audio = ttsAudioRef.current;
       if (!audio) {
         setStatus("⚠️ Áudio não inicializado.");
-        URL.revokeObjectURL(url);
         return;
       }
 
-      try {
-        audio.pause();
-      } catch {}
       audio.src = url;
-      audio.currentTime = 0;
+      audio.muted = false;
+      audio.volume = 1;
 
-      const tryPlay = async () => {
-        try {
-          await audio.play();
-        } catch (err: any) {
-          // Safari/iOS pode exigir novo gesto do utilizador
-          if (err?.name === "NotAllowedError") {
-            setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã para ouvir.");
-            const once = () => {
-              audio.play().catch(() => {});
-              document.removeEventListener("click", once);
-              document.removeEventListener("touchstart", once);
-            };
-            document.addEventListener("click", once, { once: true });
-            document.addEventListener("touchstart", once, { once: true });
-          } else {
-            setStatus("⚠️ Erro ao reproduzir áudio: " + (err?.message || err));
-          }
-        } finally {
-          audio.onended = () => {
-            URL.revokeObjectURL(url);
-            audio.onended = null;
-          };
-        }
-      };
+      // força o iOS a preparar a fonte nova antes de play
+      try {
+        audio.load();
+      } catch {}
 
-      // pequeno atraso ajuda o Safari a estabilizar o elemento <audio>
-      setTimeout(tryPlay, 50);
+      try {
+        await audio.play();
+      } catch (e: any) {
+        setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
+      }
     } catch (e: any) {
       setStatus("⚠️ Erro no TTS: " + (e?.message || e));
     }
