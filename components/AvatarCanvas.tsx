@@ -1,86 +1,61 @@
 "use client";
 
-import React, { Suspense, useEffect, useMemo, useState } from "react";
 import { Canvas } from "@react-three/fiber";
-import { OrbitControls, useGLTF, Environment } from "@react-three/drei";
+import { Environment, OrbitControls, useGLTF } from "@react-three/drei";
+import React, { Suspense, useMemo } from "react";
 
-// Verifica suporte WebGL no browser
-function hasWebGL(): boolean {
-  try {
-    const c = document.createElement("canvas");
-    return !!(
-      (c.getContext("webgl") as WebGLRenderingContext | null) ||
-      (c.getContext("experimental-webgl") as WebGLRenderingContext | null)
-    );
-  } catch {
-    return false;
-  }
-}
-
-function AvatarModel({ url }: { url: string }) {
-  const { scene } = useGLTF(url);
-  return <primitive object={scene} scale={1.35} position={[0, -1.2, 0]} />;
-}
-
-export default function AvatarCanvas({
-  url,
-  height = 720,
-}: {
+type Props = {
   url: string;
   height?: number;
-}) {
-  const [webgl, setWebgl] = useState<boolean>(true);
+  fov?: number;
+};
 
-  // Preload do modelo (melhor UX)
-  useEffect(() => {
-    try {
-      // @ts-ignore – a tipagem do drei permite isto
-      useGLTF.preload(url);
-    } catch {
-      // ignora se não der preload
-    }
-  }, [url]);
+function Model({ url }: { url: string }) {
+  // @react-three/drei trata de fazer cache do GLTF
+  const gltf = useGLTF(url, true);
+  return <primitive object={gltf.scene} dispose={null} />;
+}
 
-  useEffect(() => {
-    setWebgl(hasWebGL());
-  }, []);
+// evita warnings do TS sobre GLTF loader
+useGLTF.preload(
+  "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb"
+);
 
-  const camera = useMemo(() => ({ position: [0, 1.6, 3] as [number, number, number], fov: 40 }), []);
-
-  if (!webgl) {
-    return (
-      <div
-        style={{
-          width: "100%",
-          height,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: "#bbb",
-          border: "1px solid #333",
-          borderRadius: 12,
-          background: "#0b0b0b",
-          textAlign: "center",
-          padding: 16,
-        }}
-      >
-        O teu browser não suporta WebGL. Tenta no Chrome/Edge/Firefox atualizados.
-      </div>
-    );
-  }
+export default function AvatarCanvas({ url, height = 720, fov = 35 }: Props) {
+  // clamp simples para viewport estável
+  const canvasStyle = useMemo(
+    () => ({
+      width: "100%",
+      height,
+      border: "1px solid #333",
+      borderRadius: 12,
+      background: "#0b0b0b",
+    }),
+    [height]
+  );
 
   return (
-    <div style={{ width: "100%", height }}>
-      <Canvas camera={camera}>
-        <ambientLight intensity={0.8} />
-        <directionalLight position={[2, 5, 2]} intensity={1} />
+    <div style={canvasStyle}>
+      <Canvas
+        camera={{ position: [0, 1.4, 2.2], fov }}
+        dpr={[1, 2]}
+        gl={{ antialias: true, preserveDrawingBuffer: false }}
+      >
+        <ambientLight intensity={0.6} />
+        <directionalLight position={[3, 5, 2]} intensity={1.1} />
 
         <Suspense fallback={null}>
-          <AvatarModel url={url} />
-          <Environment preset="city" />
+          <Model url={url} />
+          <Environment preset="studio" />
         </Suspense>
 
-        <OrbitControls enablePan={false} />
+        <OrbitControls
+          enablePan={false}
+          minDistance={1.2}
+          maxDistance={3.5}
+          minPolarAngle={Math.PI / 3.2}
+          maxPolarAngle={(5 * Math.PI) / 6}
+        />
       </Canvas>
     </div>
   );
