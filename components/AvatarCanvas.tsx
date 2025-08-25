@@ -5,110 +5,121 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-const DEFAULT_URL =
+// Põe aqui o URL do teu avatar RPM (ou usa a env NEXT_PUBLIC_RPM_AVATAR_URL)
+const AVATAR_URL =
   process.env.NEXT_PUBLIC_RPM_AVATAR_URL ||
   "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb";
 
-type Props = {
-  url?: string;
-  height?: number;
-};
-
-export default function AvatarCanvas({ url = DEFAULT_URL, height = 720 }: Props) {
+export default function AvatarCanvas() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const container = containerRef.current!;
-    if (!container) return;
+    const el = containerRef.current!;
+    const width = el.clientWidth;
+    const height = el.clientHeight;
 
-    // Renderer
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-    renderer.setSize(container.clientWidth, height);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    container.appendChild(renderer.domElement);
-
-    // Scene & Camera
+    // cena
     const scene = new THREE.Scene();
-    scene.background = null;
+    scene.background = new THREE.Color("#0b0b0b");
 
-    const camera = new THREE.PerspectiveCamera(35, container.clientWidth / height, 0.1, 100);
-    camera.position.set(0, 1.5, 2.8);
+    // câmara
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
+    camera.position.set(0, 1.6, 2.2);
 
-    // Lights
-    const ambient = new THREE.AmbientLight(0xffffff, 0.7);
-    scene.add(ambient);
+    // renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(width, height);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    el.appendChild(renderer.domElement);
 
-    const dir = new THREE.DirectionalLight(0xffffff, 1.1);
-    dir.position.set(5, 5, 5);
+    // luz
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    hemi.position.set(0, 2, 0);
+    scene.add(hemi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+    dir.position.set(2, 4, 2);
     scene.add(dir);
 
-    // Controls
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enablePan = false;
-    controls.target.set(0, 1.2, 0);
-    controls.update();
+    // chão suave
+    const ground = new THREE.Mesh(
+      new THREE.CircleGeometry(2.5, 64),
+      new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
 
-    // Load GLB
+    // controls
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.5, 0);
+    controls.enableDamping = true;
+    controls.maxDistance = 5;
+    controls.minDistance = 1.2;
+
+    // carregar GLB
     const loader = new GLTFLoader();
-    let model: THREE.Object3D | null = null;
+    let avatar: THREE.Group | null = null;
 
     loader.load(
-      url,
+      AVATAR_URL,
       (gltf) => {
-        model = gltf.scene;
-        // posiciona suavemente o avatar
-        model.position.set(0, -1.4, 0);
-        scene.add(model);
+        avatar = gltf.scene;
+        // tentativa de posicionamento padrão para RPM
+        avatar.traverse((o: any) => {
+          if (o.isMesh) {
+            o.castShadow = true;
+            o.receiveShadow = false;
+          }
+        });
+        avatar.position.set(0, 0, 0);
+        scene.add(avatar);
       },
       undefined,
       (err) => {
-        console.error("Falha ao carregar o GLB:", err);
+        console.error("Falha a carregar GLB:", err);
       }
     );
 
-    // Resize handler
-    function onResize() {
-      if (!container) return;
-      const w = container.clientWidth;
-      const h = height;
+    // resize
+    const onResize = () => {
+      const w = el.clientWidth;
+      const h = el.clientHeight;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-    }
+    };
     const ro = new ResizeObserver(onResize);
-    ro.observe(container);
+    ro.observe(el);
 
-    // Loop
+    // loop
     let raf = 0;
     const tick = () => {
-      raf = requestAnimationFrame(tick);
+      controls.update();
       renderer.render(scene, camera);
+      raf = requestAnimationFrame(tick);
     };
     tick();
 
-    // Cleanup
+    // clean-up
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
-      controls.dispose();
-      if (model) scene.remove(model);
+      el.removeChild(renderer.domElement);
       renderer.dispose();
-      container.removeChild(renderer.domElement);
+      // descarregar geometria/material/texturas
+      scene.traverse((obj: any) => {
+        if (obj.geometry) obj.geometry.dispose?.();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose?.());
+          else obj.material.dispose?.();
+        }
+        if (obj.texture) obj.texture.dispose?.();
+      });
     };
-  }, [url, height]);
+  }, []);
 
-  return (
-    <div
-      ref={containerRef}
-      style={{
-        width: "100%",
-        height,
-        borderRadius: 12,
-        overflow: "hidden",
-        border: "1px solid #333",
-        background: "#0b0b0b",
-      }}
-    />
-  );
+  return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
 }
