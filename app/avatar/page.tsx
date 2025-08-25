@@ -1,9 +1,10 @@
-// app/avatar/page.tsx
+"use client";
+
 import React from "react";
 import dynamic from "next/dynamic";
 
 const DynamicAvatarCanvas = dynamic(() => import("@/components/AvatarCanvas"), {
-  ssr: false, // evita SSR com WebGL
+  ssr: false,
   loading: () => (
     <div
       style={{
@@ -23,7 +24,6 @@ const DynamicAvatarCanvas = dynamic(() => import("@/components/AvatarCanvas"), {
   ),
 });
 
-// Pequeno ErrorBoundary para apanhar exceções no cliente
 class ClientErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { hasError: boolean; msg?: string }
@@ -36,7 +36,6 @@ class ClientErrorBoundary extends React.Component<
     return { hasError: true, msg: err?.message || String(err) };
   }
   componentDidCatch(err: any) {
-    // opcional: enviar para logging
     console.error("Avatar client error:", err);
   }
   render() {
@@ -51,10 +50,11 @@ class ClientErrorBoundary extends React.Component<
             color: "#eee",
           }}
         >
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>⚠️ Erro a carregar o avatar</div>
-          <div style={{ opacity: 0.8, whiteSpace: "pre-wrap" }}>{this.state.msg}</div>
-          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
-            Verifica se o teu browser suporta WebGL e que não tens extensões a bloquear scripts.
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>
+            ⚠️ Erro a carregar o avatar
+          </div>
+          <div style={{ opacity: 0.8, whiteSpace: "pre-wrap" }}>
+            {this.state.msg}
           </div>
         </div>
       );
@@ -64,7 +64,6 @@ class ClientErrorBoundary extends React.Component<
 }
 
 export default function AvatarPage() {
-  // Podes trocar por process.env.NEXT_PUBLIC_AVATAR_URL se preferires via env
   const url =
     process.env.NEXT_PUBLIC_AVATAR_URL ??
     "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb";
@@ -76,12 +75,15 @@ export default function AvatarPage() {
         margin: "0 auto",
         padding: 16,
         fontFamily:
-          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
+          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial',
       }}
     >
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🧍 Avatar (Ready Player Me)</h1>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
+        🧍 Avatar (Ready Player Me)
+      </h1>
       <p style={{ opacity: 0.8, marginBottom: 16 }}>
-        Se não vires o avatar, abre a consola do browser: há normalmente detalhes do erro.
+        Se não vires o avatar, abre a consola do browser: há normalmente
+        detalhes do erro.
       </p>
 
       <ClientErrorBoundary>
