@@ -11,7 +11,10 @@
   "dependencies": {
     "next": "15.3.0",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "three": "^0.160.0",
+    "@react-three/fiber": "^8.13.6",
+    "@react-three/drei": "^9.86.6"
   },
   "devDependencies": {
     "@types/node": "20.11.30",
@@ -20,3 +23,4 @@
     "typescript": "5.5.3"
   }
 }
+
