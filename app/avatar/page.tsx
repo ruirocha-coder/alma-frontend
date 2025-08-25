@@ -1,28 +1,92 @@
-"use client";
-
+// app/avatar/page.tsx
 import React from "react";
 import dynamic from "next/dynamic";
 
-// Import relativo para evitar erro de alias "@/"
-const AvatarCanvas = dynamic(() => import("../../components/AvatarCanvas"), {
-  ssr: false,
+const DynamicAvatarCanvas = dynamic(() => import("@/components/AvatarCanvas"), {
+  ssr: false, // evita SSR com WebGL
+  loading: () => (
+    <div
+      style={{
+        width: "100%",
+        height: 720,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "#bbb",
+        border: "1px solid #333",
+        borderRadius: 12,
+        background: "#0b0b0b",
+      }}
+    >
+      A carregar o avatar…
+    </div>
+  ),
 });
 
+// Pequeno ErrorBoundary para apanhar exceções no cliente
+class ClientErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; msg?: string }
+> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, msg: undefined };
+  }
+  static getDerivedStateFromError(err: any) {
+    return { hasError: true, msg: err?.message || String(err) };
+  }
+  componentDidCatch(err: any) {
+    // opcional: enviar para logging
+    console.error("Avatar client error:", err);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div
+          style={{
+            padding: 16,
+            border: "1px solid #333",
+            borderRadius: 12,
+            background: "#1a1a1a",
+            color: "#eee",
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>⚠️ Erro a carregar o avatar</div>
+          <div style={{ opacity: 0.8, whiteSpace: "pre-wrap" }}>{this.state.msg}</div>
+          <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
+            Verifica se o teu browser suporta WebGL e que não tens extensões a bloquear scripts.
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function AvatarPage() {
-  // URL do avatar .glb — usa variável de ambiente se existir
+  // Podes trocar por process.env.NEXT_PUBLIC_AVATAR_URL se preferires via env
   const url =
-    process.env.NEXT_PUBLIC_RPM_GLTF_URL ||
+    process.env.NEXT_PUBLIC_AVATAR_URL ??
     "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb";
 
   return (
-    <main style={{ maxWidth: 900, margin: "0 auto", padding: 16 }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>
-        🎭 Avatar (Ready Player Me)
-      </h1>
+    <main
+      style={{
+        maxWidth: 960,
+        margin: "0 auto",
+        padding: 16,
+        fontFamily:
+          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
+      }}
+    >
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🧍 Avatar (Ready Player Me)</h1>
       <p style={{ opacity: 0.8, marginBottom: 16 }}>
-        A carregar modelo: <code>{url}</code>
+        Se não vires o avatar, abre a consola do browser: há normalmente detalhes do erro.
       </p>
-      <AvatarCanvas url={url} height={560} />
+
+      <ClientErrorBoundary>
+        <DynamicAvatarCanvas url={url} height={720} />
+      </ClientErrorBoundary>
     </main>
   );
 }
