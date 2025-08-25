@@ -3,26 +3,30 @@
 import React from "react";
 import dynamic from "next/dynamic";
 
-const DynamicAvatarCanvas = dynamic(() => import("@/components/AvatarCanvas"), {
-  ssr: false,
-  loading: () => (
-    <div
-      style={{
-        width: "100%",
-        height: 720,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        color: "#bbb",
-        border: "1px solid #333",
-        borderRadius: 12,
-        background: "#0b0b0b",
-      }}
-    >
-      A carregar o avatar…
-    </div>
-  ),
-});
+// usa caminho relativo para evitar problemas de alias "@"
+const DynamicAvatarCanvas = dynamic(
+  () => import("../../components/AvatarCanvas"),
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        style={{
+          width: "100%",
+          height: 720,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "#bbb",
+          border: "1px solid #333",
+          borderRadius: 12,
+          background: "#0b0b0b",
+        }}
+      >
+        A carregar o avatar…
+      </div>
+    ),
+  }
+);
 
 class ClientErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -82,8 +86,7 @@ export default function AvatarPage() {
         🧍 Avatar (Ready Player Me)
       </h1>
       <p style={{ opacity: 0.8, marginBottom: 16 }}>
-        Se não vires o avatar, abre a consola do browser: há normalmente
-        detalhes do erro.
+        Se não vires o avatar, abre a consola do browser para detalhes.
       </p>
 
       <ClientErrorBoundary>
