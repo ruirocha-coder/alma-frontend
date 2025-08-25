@@ -1,101 +1,39 @@
 "use client";
 
-import React, { Suspense, useMemo } from "react";
+import React, { Suspense } from "react";
 import { Canvas } from "@react-three/fiber";
-import {
-  OrbitControls,
-  Environment,
-  ContactShadows,
-  Html,
-  useProgress,
-  useGLTF,
-} from "@react-three/drei";
-
-type AvatarCanvasProps = {
-  glbUrl: string;
-  autoRotate?: boolean;
-  zoom?: number; // 1 = perto, 2 = mais longe
-};
-
-function Loader() {
-  const { progress } = useProgress();
-  return (
-    <Html center style={{ color: "#fff", fontSize: 14 }}>
-      {`A carregar… ${progress.toFixed(0)}%`}
-    </Html>
-  );
-}
+import { OrbitControls, useGLTF, Environment } from "@react-three/drei";
 
 function AvatarModel({ url }: { url: string }) {
-  // Ready Player Me usa GLB (Y-up, escala em metros)
-  const { scene } = useGLTF(url, true);
-  // Ajustes suaves para caber na cena
-  const model = useMemo(() => {
-    const s = scene.clone();
-    s.traverse((o: any) => {
-      if (o.isMesh) {
-        o.castShadow = true;
-        o.receiveShadow = true;
-      }
-    });
-    s.position.set(0, -1.05, 0); // descer um bocadinho
-    s.scale.setScalar(1.05);
-    return s;
-  }, [scene]);
-  return <primitive object={model} />;
+  const { scene } = useGLTF(url);
+
+  // aplica escala manual para o avatar não ficar pequeno
+  return <primitive object={scene} scale={1.3} position={[0, -1.2, 0]} />;
 }
 
 export default function AvatarCanvas({
-  glbUrl,
-  autoRotate = true,
-  zoom = 1.4,
-}: AvatarCanvasProps) {
+  url,
+  height = 720,
+}: {
+  url: string;
+  height?: number;
+}) {
   return (
-    <div
-      style={{
-        width: "100%",
-        aspectRatio: "16/9",
-        background: "#0a0a0a",
-        border: "1px solid #222",
-        borderRadius: 12,
-        overflow: "hidden",
-      }}
-    >
-      <Canvas
-        shadows
-        dpr={[1, 2]}
-        camera={{ position: [0, 1.25, 2.25 * zoom], fov: 35 }}
-      >
+    <div style={{ width: "100%", height }}>
+      <Canvas camera={{ position: [0, 1.6, 3], fov: 40 }}>
+        {/* luzes */}
         <ambientLight intensity={0.8} />
-        <directionalLight
-          position={[3, 4, 2]}
-          intensity={1.2}
-          castShadow
-          shadow-mapSize-width={1024}
-          shadow-mapSize-height={1024}
-        />
-        <Suspense fallback={<Loader />}>
-          <AvatarModel url={glbUrl} />
-          <ContactShadows
-            position={[0, -1.1, 0]}
-            scale={4}
-            blur={2.5}
-            opacity={0.4}
-          />
-          <Environment preset="studio" />
+        <directionalLight position={[2, 5, 2]} intensity={1} />
+
+        {/* ambiente realista */}
+        <Suspense fallback={null}>
+          <AvatarModel url={url} />
+          <Environment preset="city" />
         </Suspense>
-        <OrbitControls
-          enablePan={false}
-          enableZoom={false}
-          autoRotate={autoRotate}
-          autoRotateSpeed={0.8}
-          minPolarAngle={Math.PI * 0.35}
-          maxPolarAngle={Math.PI * 0.55}
-        />
+
+        {/* controlo de orbitas */}
+        <OrbitControls enablePan={false} />
       </Canvas>
     </div>
   );
 }
-
-// Opcional: para acelerar carregamentos futuros quando o URL for fixo
-// useGLTF.preload("https://models.readyplayer.me/68ac391e858e75812baf48c2.glb");
