@@ -2,7 +2,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 
-type LogItem = { role: "you" | "alma"; text: string };
+type LogItem = { role: "you" | "alma" | "sys"; text: string };
 
 const STT_WS_URL =
   (typeof window !== "undefined" && (window as any).env?.NEXT_PUBLIC_STT_WS_URL) ||
@@ -15,20 +15,28 @@ export default function StreamPage() {
   const [status, setStatus] = useState("Pronto (streaming em página separada)");
   const [isArmed, setIsArmed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+
   const [transcript, setTranscript] = useState("");
   const [answer, setAnswer] = useState("");
   const [log, setLog] = useState<LogItem[]>([]);
+
+  const [level, setLevel] = useState(0);         // nível de input (0..1)
+  const [kbSent, setKbSent] = useState(0);       // contador de bytes enviados
+  const bytesSentRef = useRef(0);
 
   // Áudio in/out
   const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const srcNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const procRef = useRef<ScriptProcessorNode | null>(null);
+  const muteGainRef = useRef<GainNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
 
   // WebSocket
   const wsRef = useRef<WebSocket | null>(null);
 
-  // TTS player
+  // TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // ------ setup TTS <audio> e desbloqueio iOS ------
@@ -64,7 +72,11 @@ export default function StreamPage() {
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
+        audio: {
+          channelCount: 1,
+          noiseSuppression: true,
+          echoCancellation: false,
+        },
         video: false,
       });
       streamRef.current = stream;
@@ -85,23 +97,21 @@ export default function StreamPage() {
     return out;
   }
 
-  function downsampleBuffer(buffer: Float32Array, inSampleRate: number, outSampleRate: number) {
-    if (outSampleRate === inSampleRate) return buffer;
-    const ratio = inSampleRate / outSampleRate;
+  function downsample(buffer: Float32Array, inSr: number, outSr: number) {
+    if (outSr === inSr) return buffer;
+    const ratio = inSr / outSr;
     const newLen = Math.round(buffer.length / ratio);
+    if (!isFinite(newLen) || newLen <= 0) return new Float32Array(0);
     const result = new Float32Array(newLen);
-    let offsetResult = 0;
-    let offsetBuffer = 0;
-    while (offsetResult < newLen) {
-      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-      let accum = 0, count = 0;
-      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-        accum += buffer[i];
-        count++;
+    let offR = 0, offB = 0;
+    while (offR < newLen) {
+      const nextOffB = Math.round((offR + 1) * ratio);
+      let acc = 0, count = 0;
+      for (let i = offB; i < nextOffB && i < buffer.length; i++) {
+        acc += buffer[i]; count++;
       }
-      result[offsetResult] = accum / count;
-      offsetResult++;
-      offsetBuffer = nextOffsetBuffer;
+      result[offR] = count > 0 ? acc / count : 0;
+      offR++; offB = nextOffB;
     }
     return result;
   }
@@ -148,7 +158,7 @@ export default function StreamPage() {
   async function askAlma(q: string) {
     setTranscript(q);
     setLog((l) => [...l, { role: "you", text: q }]);
-    setStatus("🧠 A perguntar à Alma…");
+    setStatus(isStreaming ? "🧠 (stream) a perguntar à Alma…" : "🧠 A perguntar à Alma…");
     try {
       const r = await fetch("/api/alma", {
         method: "POST",
@@ -172,17 +182,49 @@ export default function StreamPage() {
     }
   }
 
+  // ------ meter (nível de micro) ------
+  function startMeter() {
+    const ctx = audioCtxRef.current;
+    const analyser = ctx!.createAnalyser();
+    analyser.fftSize = 2048;
+    analyserRef.current = analyser;
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const loop = () => {
+      analyser.getByteTimeDomainData(data);
+      // RMS simples
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      setLevel(rms);
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+  }
+
+  function stopMeter() {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    analyserRef.current = null;
+  }
+
   // ------ start/stop streaming (PCM via WebAudio) ------
   async function toggleStreaming() {
     if (isStreaming) {
-      // parar
       try { procRef.current?.disconnect(); } catch {}
       try { srcNodeRef.current?.disconnect(); } catch {}
+      try { muteGainRef.current?.disconnect(); } catch {}
       try { audioCtxRef.current?.close(); } catch {}
       try { wsRef.current?.close(); } catch {}
+      stopMeter();
       audioCtxRef.current = null;
       procRef.current = null;
       srcNodeRef.current = null;
+      muteGainRef.current = null;
       wsRef.current = null;
       setIsStreaming(false);
       setStatus("Streaming parado.");
@@ -204,10 +246,10 @@ export default function StreamPage() {
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
-        // diz ao servidor que virá PCM 16k
         const hello = { type: "start", language: "pt-PT", format: "pcm_s16le", sampleRate: TARGET_SR };
         try { ws.send(JSON.stringify(hello)); } catch {}
-        setStatus("🟢 Streaming ligado. A enviar áudio (PCM 16k) …");
+        setStatus("🟢 Streaming ligado. A enviar áudio (PCM 16k)…");
+        setLog((l)=>[...l, {role:"sys", text:`WS OPEN ${STT_WS_URL}`}]);
       };
 
       ws.onmessage = async (ev) => {
@@ -221,6 +263,7 @@ export default function StreamPage() {
             await askAlma(msg.transcript);
           } else if (msg.type === "error") {
             setStatus("⚠️ STT (WS): " + msg.error);
+            setLog((l)=>[...l, {role:"sys", text:"STT error: "+msg.error}]);
           }
         } catch {}
       };
@@ -228,6 +271,7 @@ export default function StreamPage() {
       ws.onerror = (e) => {
         console.warn("[WS] error:", e);
         setStatus("⚠️ Erro no WebSocket STT.");
+        setLog((l)=>[...l, {role:"sys", text:"WS ERROR (ver consola)"}]);
       };
 
       ws.onclose = () => {
@@ -235,34 +279,64 @@ export default function StreamPage() {
         setIsStreaming(false);
         try { procRef.current?.disconnect(); } catch {}
         try { srcNodeRef.current?.disconnect(); } catch {}
+        try { muteGainRef.current?.disconnect(); } catch {}
         try { audioCtxRef.current?.close(); } catch {}
+        stopMeter();
+        setLog((l)=>[...l, {role:"sys", text:"WS CLOSE"}]);
       };
 
       wsRef.current = ws;
 
       // WebAudio pipeline
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const Ctx = (window.AudioContext || (window as any).webkitAudioContext);
+      const ctx = new Ctx();
       audioCtxRef.current = ctx;
+
+      // tem MESMO de haver gesto do utilizador antes
       await ctx.resume();
 
       const source = ctx.createMediaStreamSource(streamRef.current!);
       srcNodeRef.current = source;
 
-      const bufferSize = 2048; // latência baixa
+      // meter
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
+
+      // mute gain (mantém a cadeia viva)
+      const muteGain = ctx.createGain();
+      muteGain.gain.value = 0;
+      muteGainRef.current = muteGain;
+
+      // processor
+      const bufferSize = 2048;
       const proc = ctx.createScriptProcessor(bufferSize, 1, 1);
       procRef.current = proc;
 
       proc.onaudioprocess = (e) => {
         const ch0 = e.inputBuffer.getChannelData(0);
-        const down = downsampleBuffer(ch0, ctx.sampleRate, TARGET_SR);
+        const down = downsample(ch0, ctx.sampleRate, TARGET_SR);
+        if (down.length === 0) return; // proteção
         const pcm16 = floatTo16BitPCM(down);
         if (wsRef.current && wsRef.current.readyState === 1) {
-          try { wsRef.current.send(pcm16.buffer); } catch {}
+          try {
+            wsRef.current.send(pcm16.buffer);
+            bytesSentRef.current += pcm16.byteLength;
+            if ((bytesSentRef.current & 0xfff) === 0) {
+              // atualiza a cada ~4KB para não re-render contínuo
+              setKbSent(bytesSentRef.current / 1024);
+            }
+          } catch {}
         }
       };
 
-      source.connect(proc);
-      proc.connect(ctx.destination); // (necessário em alguns browsers para disparar callbacks)
+      // cadeia: source -> analyser -> proc -> muteGain -> destination
+      source.connect(analyser);
+      analyser.connect(proc);
+      proc.connect(muteGain);
+      muteGain.connect(ctx.destination);
+
+      startMeter();
 
       setIsStreaming(true);
       setStatus("🎧 Streaming a decorrer…");
@@ -271,12 +345,17 @@ export default function StreamPage() {
     }
   }
 
-  function copyLog() {
-    const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
-    navigator.clipboard.writeText(txt).then(() => {
-      setStatus("Histórico copiado.");
-      setTimeout(() => setStatus(isStreaming ? "🎧 Streaming a decorrer…" : "Pronto"), 1200);
-    });
+  // ---- botão de teste (envia 1 frame silencioso) ----
+  function sendSilentFrame() {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== 1) return;
+    const pcm16 = new Int16Array(TARGET_SR / 10); // 100 ms silêncio
+    try {
+      ws.send(pcm16.buffer);
+      bytesSentRef.current += pcm16.byteLength;
+      setKbSent(bytesSentRef.current / 1024);
+      setLog((l)=>[...l, {role:"sys", text:"Silent 100ms frame enviado"}]);
+    } catch {}
   }
 
   return (
@@ -295,7 +374,10 @@ export default function StreamPage() {
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
         🎭 Alma — Streaming (PCM 16 kHz)
       </h1>
-      <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
+      <p style={{ opacity: 0.85, marginBottom: 6 }}>{status}</p>
+      <div style={{ fontSize: 12, color: "#aaa", marginBottom: 16 }}>
+        Nível: {(level * 100).toFixed(0)}% • Enviado: {kbSent.toFixed(1)} KB • WS: {STT_WS_URL || "(não definido)"}
+      </div>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
@@ -325,16 +407,17 @@ export default function StreamPage() {
         </button>
 
         <button
-          onClick={copyLog}
+          onClick={sendSilentFrame}
+          disabled={!isStreaming}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
             border: "1px solid #444",
-            background: "#222",
+            background: isStreaming ? "#222" : "#111",
             color: "#ddd",
           }}
         >
-          Copiar histórico
+          Enviar 100ms silêncio (teste)
         </button>
 
         <a
@@ -373,12 +456,14 @@ export default function StreamPage() {
         <hr style={{ borderColor: "#222", margin: "8px 0 12px" }} />
 
         <div>
-          <div style={{ fontWeight: 600, color: "#aaa", marginBottom: 6 }}>Histórico</div>
+          <div style={{ fontWeight: 600, color: "#aaa", marginBottom: 6 }}>Log</div>
           <div style={{ display: "grid", gap: 6 }}>
             {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
             {log.map((m, i) => (
               <div key={i} style={{ whiteSpace: "pre-wrap" }}>
-                <span style={{ color: "#999" }}>{m.role === "you" ? "Tu:" : "Alma:"}</span>{" "}
+                <span style={{ color: m.role === "sys" ? "#7aa" : "#999" }}>
+                  {m.role === "you" ? "Tu:" : m.role === "alma" ? "Alma:" : "SYS:"}
+                </span>{" "}
                 {m.text}
               </div>
             ))}
