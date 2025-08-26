@@ -9,73 +9,14 @@ const STT_WS_URL =
   process.env.NEXT_PUBLIC_STT_WS_URL ||
   "";
 
-/** ---------- Helpers de áudio (PCM16 16k base64) ---------- */
-
-/** Downsample Float32 PCM para 16 kHz (simples e leve) */
-function downsampleTo16kPCM(float32: Float32Array, inRate: number): Int16Array {
-  const outRate = 16000;
-  if (inRate === outRate) {
-    // só converter para int16
-    const out = new Int16Array(float32.length);
-    for (let i = 0; i < float32.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    return out;
-  }
-
-  const ratio = inRate / outRate;
-  const newLen = Math.floor(float32.length / ratio);
-  const out = new Int16Array(newLen);
-
-  let pos = 0;
-  for (let i = 0; i < newLen; i++) {
-    const idx = i * ratio;
-    const idx0 = Math.floor(idx);
-    const idx1 = Math.min(idx0 + 1, float32.length - 1);
-    const frac = idx - idx0;
-    const samp = float32[idx0] * (1 - frac) + float32[idx1] * frac;
-
-    const s = Math.max(-1, Math.min(1, samp));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    pos++;
-  }
-  return out;
-}
-
-/** Converte Blob (webm/mp4) → PCM16 16k base64 */
-async function blobToPCM16Base64(blob: Blob): Promise<string> {
-  const arrayBuffer = await blob.arrayBuffer();
-  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  const ch = audioBuffer.getChannelData(0); // mono
-  const pcm16 = downsampleTo16kPCM(ch, audioBuffer.sampleRate);
-
-  // PCM16 → base64
-  let binary = "";
-  const bytes = new Uint8Array(pcm16.buffer);
-  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
-
-/** Escolhe mimeType suportado pelo MediaRecorder */
-function chooseMime(): string {
-  if (typeof MediaRecorder === "undefined") return "audio/webm;codecs=opus";
-  if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
-  if (MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
-  return "audio/mp4"; // fallback Safari
-}
-
-/** Cria MediaRecorder com meta do mime em __mime */
-function buildMediaRecorder(stream: MediaStream): MediaRecorder {
-  const mime = chooseMime();
-  const mr = new MediaRecorder(stream, { mimeType: mime });
-  (mr as any).__mime = mime;
-  return mr;
-}
-
-/** -------------------------------------------------------- */
-
+/**
+ * Página:
+ *  - Botão "Ativar micro"
+ *  - Botão "🔴 Iniciar/Parar streaming" (NOVO: envia PCM16/16k via WebAudio)
+ *  - Botão "🎤 Segurar para falar" (upload clássico que já funcionava)
+ *  - Input de texto (pergunta por escrito)
+ *  - Fala as respostas via /api/tts
+ */
 export default function Page() {
   // -------- UI / estado
   const [status, setStatus] = useState("Pronto");
@@ -91,9 +32,14 @@ export default function Page() {
 
   // -------- Áudio / gravação
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null); // usado só no modo "hold"
   const wsRef = useRef<WebSocket | null>(null);
-  const requestTimerRef = useRef<any>(null);
+
+  // Web Audio (streaming)
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const pcmBufferRef = useRef<Float32Array | null>(null); // acumula float32 antes de resample
 
   // player TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -110,11 +56,14 @@ export default function Page() {
       if (!ttsAudioRef.current) return;
       const el = ttsAudioRef.current;
       el.muted = true;
-      el.play().then(() => {
-        el.pause();
-        el.currentTime = 0;
-        el.muted = false;
-      }).catch(() => {});
+      el
+        .play()
+        .then(() => {
+          el.pause();
+          el.currentTime = 0;
+          el.muted = false;
+        })
+        .catch(() => {});
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
     };
@@ -141,6 +90,20 @@ export default function Page() {
     } catch (e: any) {
       setStatus("⚠️ Permissão negada. Ativa o micro nas definições do navegador.");
     }
+  }
+
+  function buildMediaRecorder(): MediaRecorder {
+    let mime = "";
+    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+      mime = "audio/webm;codecs=opus";
+    } else if (MediaRecorder.isTypeSupported("audio/webm")) {
+      mime = "audio/webm";
+    } else {
+      mime = "audio/mp4"; // fallback Safari
+    }
+    const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
+    (mr as any).__mime = mime;
+    return mr;
   }
 
   // -------- TTS
@@ -206,7 +169,7 @@ export default function Page() {
     }
   }
 
-  // -------- Fluxo “segurar para falar”
+  // -------- Fluxo “segurar para falar” (UPLOAD que já funcionava)
   function startHold() {
     if (!isArmed) {
       requestMic();
@@ -218,7 +181,7 @@ export default function Page() {
     }
     try {
       setStatus("🎙️ A gravar…");
-      const mr = buildMediaRecorder(streamRef.current!);
+      const mr = buildMediaRecorder();
       mediaRecorderRef.current = mr;
 
       const chunks: BlobPart[] = [];
@@ -271,17 +234,61 @@ export default function Page() {
     }
   }
 
-  // -------- Streaming WebSocket (PCM16 base64 16k)
-  async function toggleStreaming() {
-    if (isStreaming) {
-      try { mediaRecorderRef.current?.stop(); } catch {}
-      try { wsRef.current?.close(); } catch {}
-      if (requestTimerRef.current) clearInterval(requestTimerRef.current);
-      setIsStreaming(false);
-      setStatus("Streaming parado.");
-      return;
-    }
+  // =========================
+  // ===== STREAMING PCM =====
+  // =========================
 
+  // Util: concatena Float32Arrays
+  function concatFloat32(a: Float32Array, b: Float32Array) {
+    const out = new Float32Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+
+  // Downsample simples (linear) para 16 kHz mono
+  function resampleTo16k(float32: Float32Array, fromRate: number): Int16Array {
+    const toRate = 16000;
+    if (fromRate === toRate) {
+      return floatTo16PCM(float32);
+    }
+    const ratio = fromRate / toRate;
+    const newLen = Math.floor(float32.length / ratio);
+    const out = new Float32Array(newLen);
+    let pos = 0;
+    for (let i = 0; i < newLen; i++) {
+      const idx = i * ratio;
+      const i0 = Math.floor(idx);
+      const i1 = Math.min(i0 + 1, float32.length - 1);
+      const w = idx - i0;
+      out[i] = float32[i0] * (1 - w) + float32[i1] * w;
+      pos++;
+    }
+    return floatTo16PCM(out);
+  }
+
+  function floatTo16PCM(f32: Float32Array): Int16Array {
+    const out = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      let s = Math.max(-1, Math.min(1, f32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+
+  function toBase64(int16: Int16Array): string {
+    // Mais rápido: usar Buffer em browsers modernos via Uint8Array + btoa
+    const u8 = new Uint8Array(int16.buffer);
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < u8.length; i += chunk) {
+      const sub = u8.subarray(i, i + chunk);
+      binary += String.fromCharCode.apply(null, Array.from(sub) as any);
+    }
+    return btoa(binary);
+  }
+
+  async function startStreamingPCM() {
     if (!isArmed) {
       await requestMic();
       if (!streamRef.current) return;
@@ -290,23 +297,74 @@ export default function Page() {
       setStatus("⚠️ NEXT_PUBLIC_STT_WS_URL não definido.");
       return;
     }
+    if (isStreaming) return;
 
     try {
       setStatus("🔌 A ligar ao STT…");
       const ws = new WebSocket(STT_WS_URL);
-      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
 
-      ws.onopen = () => {
-        setStatus("🟢 Streaming ligado. A enviar áudio…");
-
-        // envia START como PCM16 16k
-        const hello = { type: "start", language: "pt-PT", format: "pcm16", sampleRate: 16000 };
+      ws.onopen = async () => {
+        setStatus("🟢 Streaming ligado. A enviar áudio (PCM16/16k) …");
+        // envia handshake
         try {
-          ws.send(JSON.stringify(hello));
-          console.log("[WS] start ->", hello);
-        } catch (e) {
-          console.warn("[WS] falha a enviar start:", e);
-        }
+          ws.send(
+            JSON.stringify({
+              type: "start",
+              format: "pcm16",
+              sampleRate: 16000,
+              language: "pt-PT",
+            })
+          );
+        } catch {}
+
+        // Web Audio pipeline
+        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioCtxRef.current = ctx;
+
+        const src = ctx.createMediaStreamSource(streamRef.current!);
+        sourceRef.current = src;
+
+        // ScriptProcessorNode (bufferSize 2048 ou 4096; 1 canal)
+        const bufferSize = 2048;
+        const proc = ctx.createScriptProcessor(bufferSize, 1, 1);
+        processorRef.current = proc;
+
+        pcmBufferRef.current = new Float32Array(0);
+        src.connect(proc);
+        proc.connect(ctx.destination); // necessário em iOS para o callback correr (não fará som)
+
+        proc.onaudioprocess = (ev) => {
+          if (!wsRef.current || wsRef.current.readyState !== 1) return;
+          const inBuf = ev.inputBuffer.getChannelData(0); // Float32
+          // acumula
+          const prev = pcmBufferRef.current!;
+          const combined = concatFloat32(prev, inBuf);
+          // queremos enviar em blocos de ~20–40ms @ 16k => 320–640 samples pós-resample
+          // Para simplificar, enviaremos a cada callback tudo o que vier, resample e chunk
+          // (os tamanhos serão pequenos e frequentes).
+          // Resample para 16k
+          const int16 = resampleTo16k(combined, ctx.sampleRate);
+          // Limpa o acumulador (já enviámos tudo)
+          pcmBufferRef.current = new Float32Array(0);
+
+          if (int16.length === 0) return;
+
+          // Opcional: chunking de 20ms (320 samples) para quadros mais estáveis
+          const CH = 320; // 20ms @ 16k
+          for (let i = 0; i < int16.length; i += CH) {
+            const slice = int16.subarray(i, Math.min(i + CH, int16.length));
+            if (slice.length === 0) continue;
+            const b64 = toBase64(slice);
+            try {
+              wsRef.current!.send(JSON.stringify({ type: "audio", data: b64 }));
+            } catch (err) {
+              // ignore
+            }
+          }
+        };
+
+        setIsStreaming(true);
       };
 
       ws.onerror = (ev) => {
@@ -317,66 +375,65 @@ export default function Page() {
       ws.onclose = () => {
         setStatus("Streaming fechado.");
         setIsStreaming(false);
-        try { mediaRecorderRef.current?.stop(); } catch {}
-        if (requestTimerRef.current) clearInterval(requestTimerRef.current);
+        // limpa áudio
+        try {
+          processorRef.current?.disconnect();
+          sourceRef.current?.disconnect();
+          audioCtxRef.current?.close();
+        } catch {}
+        processorRef.current = null;
+        sourceRef.current = null;
+        audioCtxRef.current = null;
       };
 
       ws.onmessage = async (ev) => {
-        if (typeof ev.data === "string") {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg.type === "partial" && msg.transcript) {
-              setTranscript(msg.transcript);
-            } else if ((msg.type === "final" || msg.is_final) && msg.transcript) {
-              setTranscript(msg.transcript);
-              await askAlma(msg.transcript);
-            } else if (msg.type === "error") {
-              setStatus("⚠️ STT (WS): " + msg.error);
-            }
-          } catch {
-            // ignora strings não-JSON (pings)
+        if (typeof ev.data !== "string") return;
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "partial" && msg.transcript) {
+            setTranscript(msg.transcript);
+          } else if ((msg.type === "final" || msg.is_final) && msg.transcript) {
+            setTranscript(msg.transcript);
+            await askAlma(msg.transcript);
+          } else if (msg.type === "error") {
+            setStatus("⚠️ STT (WS): " + msg.error);
           }
+        } catch {
+          // ignora
         }
       };
-
-      wsRef.current = ws;
-
-      // MediaRecorder a mandar chunks => convertemos para PCM16 base64 16k e enviamos JSON
-      const mr = buildMediaRecorder(streamRef.current!);
-      mediaRecorderRef.current = mr;
-
-      mr.ondataavailable = (e) => {
-        if (!e.data || e.data.size === 0) return;
-        if (!wsRef.current || wsRef.current.readyState !== 1) return;
-
-        blobToPCM16Base64(e.data).then((b64) => {
-          try {
-            wsRef.current!.send(JSON.stringify({ type: "audio", data: b64 }));
-          } catch (err) {
-            console.warn("[WS] send falhou:", err);
-          }
-        }).catch((err) => {
-          console.warn("[WS] decode falhou:", err);
-        });
-      };
-
-      mr.onstop = () => {
-        if (wsRef.current && wsRef.current.readyState === 1) {
-          try { wsRef.current.send(JSON.stringify({ type: "stop" })); } catch {}
-        }
-      };
-
-      // arrancar (timeslice + requestData fallback)
-      mr.start(250);
-      requestTimerRef.current = setInterval(() => {
-        try { mr.requestData(); } catch {}
-      }, 250);
-
-      setIsStreaming(true);
-      setStatus("🎧 Streaming a decorrer…");
     } catch (e: any) {
       setStatus("⚠️ Falha a iniciar streaming: " + (e?.message || e));
     }
+  }
+
+  function stopStreamingPCM() {
+    try {
+      if (wsRef.current && wsRef.current.readyState === 1) {
+        try {
+          wsRef.current.send(JSON.stringify({ type: "stop" }));
+        } catch {}
+        try {
+          wsRef.current.close();
+        } catch {}
+      }
+    } catch {}
+    // fecha audio
+    try {
+      processorRef.current?.disconnect();
+      sourceRef.current?.disconnect();
+      audioCtxRef.current?.close();
+    } catch {}
+    processorRef.current = null;
+    sourceRef.current = null;
+    audioCtxRef.current = null;
+    setIsStreaming(false);
+    setStatus("Streaming parado.");
+  }
+
+  async function toggleStreaming() {
+    if (isStreaming) stopStreamingPCM();
+    else await startStreamingPCM();
   }
 
   // -------- Texto → Alma
@@ -396,7 +453,6 @@ export default function Page() {
     e.preventDefault();
     stopHold();
   }
-
   function copyLog() {
     const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
     navigator.clipboard.writeText(txt).then(() => {
