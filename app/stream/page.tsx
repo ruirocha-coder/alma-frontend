@@ -9,25 +9,29 @@ const STT_WS_URL =
   process.env.NEXT_PUBLIC_STT_WS_URL ||
   "";
 
+const TARGET_SR = 16000; // 16 kHz PCM
+
 export default function StreamPage() {
-  // ----- UI -----
   const [status, setStatus] = useState("Pronto (streaming em página separada)");
-  const [transcript, setTranscript] = useState("");
-  const [answer, setAnswer] = useState("");
   const [isArmed, setIsArmed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [answer, setAnswer] = useState("");
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // ----- Áudio / WS -----
+  // Áudio in/out
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const requestTimerRef = useRef<any>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const srcNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const procRef = useRef<ScriptProcessorNode | null>(null);
 
-  // player TTS (independente da home)
+  // WebSocket
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // TTS player
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // preparar elemento <audio> e desbloquear áudio em iOS
+  // ------ setup TTS <audio> e desbloqueio iOS ------
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true;
@@ -49,14 +53,13 @@ export default function StreamPage() {
     };
     document.addEventListener("click", unlock, { once: true });
     document.addEventListener("touchstart", unlock, { once: true });
-
     return () => {
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
     };
   }, []);
 
-  // ---- helpers ----
+  // ------ mic ------
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
@@ -66,30 +69,47 @@ export default function StreamPage() {
       });
       streamRef.current = stream;
       setIsArmed(true);
-      setStatus("Micro pronto. Carrega em Iniciar Streaming.");
+      setStatus("Micro pronto. Carrega em Iniciar streaming.");
     } catch {
       setStatus("⚠️ Permissão do micro negada.");
     }
   }
 
-  function buildMediaRecorder(): MediaRecorder {
-    let mime = "";
-    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
-      mime = "audio/webm;codecs=opus";
-    } else if (MediaRecorder.isTypeSupported("audio/webm")) {
-      mime = "audio/webm";
-    } else {
-      mime = "audio/mp4"; // fallback Safari
+  // ------ PCM helpers ------
+  function floatTo16BitPCM(float32: Float32Array): Int16Array {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
-    const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
-    (mr as any).__mime = mime;
-    return mr;
+    return out;
   }
 
+  function downsampleBuffer(buffer: Float32Array, inSampleRate: number, outSampleRate: number) {
+    if (outSampleRate === inSampleRate) return buffer;
+    const ratio = inSampleRate / outSampleRate;
+    const newLen = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLen);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < newLen) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let accum = 0, count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+        accum += buffer[i];
+        count++;
+      }
+      result[offsetResult] = accum / count;
+      offsetResult++;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+  }
+
+  // ------ TTS ------
   async function speak(text: string) {
     if (!text) return;
     try {
-      // parar áudio anterior se ainda a tocar
       const audioEl = ttsAudioRef.current;
       if (audioEl && !audioEl.paused) {
         try { audioEl.pause(); audioEl.currentTime = 0; } catch {}
@@ -109,27 +129,22 @@ export default function StreamPage() {
       const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
 
-      const audio = ttsAudioRef.current;
-      if (!audio) {
-        URL.revokeObjectURL(url);
-        setStatus("⚠️ Áudio não inicializado.");
-        return;
-      }
+      const audio = ttsAudioRef.current!;
       audio.src = url;
-      try { audio.load(); } catch {}
-
+      audio.load();
       try {
         await audio.play();
       } catch {
-        setStatus("⚠️ O navegador bloqueou o áudio (toca no ecrã e tenta de novo).");
+        setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
       } finally {
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        setTimeout(() => URL.revokeObjectURL(url), 15000);
       }
     } catch (e: any) {
       setStatus("⚠️ Erro no TTS: " + (e?.message || e));
     }
   }
 
+  // ------ Alma ------
   async function askAlma(q: string) {
     setTranscript(q);
     setLog((l) => [...l, { role: "you", text: q }]);
@@ -149,20 +164,26 @@ export default function StreamPage() {
       const out = (j.answer || "").trim();
       setAnswer(out);
       setLog((l) => [...l, { role: "alma", text: out }]);
-      setStatus("🔊 A falar…");
+      setStatus(isStreaming ? "🔊 A falar…" : "Pronto");
       await speak(out);
-      setStatus("🎧 Streaming a decorrer…");
+      setStatus(isStreaming ? "🎧 Streaming a decorrer…" : "Pronto");
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
+  // ------ start/stop streaming (PCM via WebAudio) ------
   async function toggleStreaming() {
     if (isStreaming) {
       // parar
-      try { mediaRecorderRef.current?.stop(); } catch {}
+      try { procRef.current?.disconnect(); } catch {}
+      try { srcNodeRef.current?.disconnect(); } catch {}
+      try { audioCtxRef.current?.close(); } catch {}
       try { wsRef.current?.close(); } catch {}
-      if (requestTimerRef.current) clearInterval(requestTimerRef.current);
+      audioCtxRef.current = null;
+      procRef.current = null;
+      srcNodeRef.current = null;
+      wsRef.current = null;
       setIsStreaming(false);
       setStatus("Streaming parado.");
       return;
@@ -183,24 +204,10 @@ export default function StreamPage() {
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
-        setStatus("🟢 Streaming ligado. A enviar áudio…");
-        // envia start com o mime detetado
-        const mime = (mediaRecorderRef.current as any)?.__mime || "audio/webm;codecs=opus";
-        try {
-          ws.send(JSON.stringify({ type: "start", language: "pt-PT", format: mime }));
-        } catch {}
-      };
-
-      ws.onerror = (ev) => {
-        console.warn("[WS] erro", ev);
-        setStatus("⚠️ Erro no WebSocket STT.");
-      };
-
-      ws.onclose = () => {
-        setStatus("Streaming fechado.");
-        setIsStreaming(false);
-        try { mediaRecorderRef.current?.stop(); } catch {}
-        if (requestTimerRef.current) clearInterval(requestTimerRef.current);
+        // diz ao servidor que virá PCM 16k
+        const hello = { type: "start", language: "pt-PT", format: "pcm_s16le", sampleRate: TARGET_SR };
+        try { ws.send(JSON.stringify(hello)); } catch {}
+        setStatus("🟢 Streaming ligado. A enviar áudio (PCM 16k) …");
       };
 
       ws.onmessage = async (ev) => {
@@ -215,37 +222,47 @@ export default function StreamPage() {
           } else if (msg.type === "error") {
             setStatus("⚠️ STT (WS): " + msg.error);
           }
-        } catch {
-          // ignora strings não-JSON (ping/pong)
-        }
+        } catch {}
+      };
+
+      ws.onerror = (e) => {
+        console.warn("[WS] error:", e);
+        setStatus("⚠️ Erro no WebSocket STT.");
+      };
+
+      ws.onclose = () => {
+        setStatus("Streaming fechado.");
+        setIsStreaming(false);
+        try { procRef.current?.disconnect(); } catch {}
+        try { srcNodeRef.current?.disconnect(); } catch {}
+        try { audioCtxRef.current?.close(); } catch {}
       };
 
       wsRef.current = ws;
 
-      const mr = buildMediaRecorder();
-      mediaRecorderRef.current = mr;
+      // WebAudio pipeline
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioCtxRef.current = ctx;
+      await ctx.resume();
 
-      mr.ondataavailable = (e) => {
-        if (!e.data || e.data.size === 0) return;
-        if (!wsRef.current || wsRef.current.readyState !== 1) return;
-        e.data.arrayBuffer().then((buf) => {
-          try { wsRef.current!.send(buf); } catch (err) {
-            console.warn("[WS] send falhou:", err);
-          }
-        });
-      };
+      const source = ctx.createMediaStreamSource(streamRef.current!);
+      srcNodeRef.current = source;
 
-      mr.onstop = () => {
+      const bufferSize = 2048; // latência baixa
+      const proc = ctx.createScriptProcessor(bufferSize, 1, 1);
+      procRef.current = proc;
+
+      proc.onaudioprocess = (e) => {
+        const ch0 = e.inputBuffer.getChannelData(0);
+        const down = downsampleBuffer(ch0, ctx.sampleRate, TARGET_SR);
+        const pcm16 = floatTo16BitPCM(down);
         if (wsRef.current && wsRef.current.readyState === 1) {
-          try { wsRef.current.send(JSON.stringify({ type: "stop" })); } catch {}
+          try { wsRef.current.send(pcm16.buffer); } catch {}
         }
       };
 
-      // timeslice + requestData para garantir envio (Safari/Chrome)
-      mr.start(250);
-      requestTimerRef.current = setInterval(() => {
-        try { mr.requestData(); } catch {}
-      }, 250);
+      source.connect(proc);
+      proc.connect(ctx.destination); // (necessário em alguns browsers para disparar callbacks)
 
       setIsStreaming(true);
       setStatus("🎧 Streaming a decorrer…");
@@ -276,7 +293,7 @@ export default function StreamPage() {
       }}
     >
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
-        🎭 Alma — Streaming (página separada)
+        🎭 Alma — Streaming (PCM 16 kHz)
       </h1>
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
@@ -345,12 +362,13 @@ export default function StreamPage() {
       >
         <div style={{ marginBottom: 8 }}>
           <div style={{ fontWeight: 600, color: "#aaa" }}>Tu (último):</div>
-          <div style={{ whiteSpace: "pre-wrap" }}>{transcript || "—"}</div>
         </div>
-        <div style={{ marginBottom: 12 }}>
+        <div style={{ whiteSpace: "pre-wrap", marginBottom: 12 }}>{transcript || "—"}</div>
+
+        <div style={{ marginBottom: 8 }}>
           <div style={{ fontWeight: 600, color: "#aaa" }}>Alma (último):</div>
-          <div style={{ whiteSpace: "pre-wrap" }}>{answer || "—"}</div>
         </div>
+        <div style={{ whiteSpace: "pre-wrap", marginBottom: 12 }}>{answer || "—"}</div>
 
         <hr style={{ borderColor: "#222", margin: "8px 0 12px" }} />
 
