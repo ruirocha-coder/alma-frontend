@@ -12,17 +12,17 @@ const STT_WS_URL =
 /**
  * Página:
  *  - Botão "Ativar micro"
- *  - Botão "🔴 Iniciar/Parar streaming" (NOVO: envia PCM16/16k via WebAudio)
- *  - Botão "🎤 Segurar para falar" (upload clássico que já funcionava)
- *  - Input de texto (pergunta por escrito)
+ *  - Botão "🔴 Iniciar/Parar streaming" (PCM16/16k via AudioWorklet/ScriptProcessor)
+ *  - Botão "🎤 Segurar para falar" (UPLOAD clássico que já funcionava)
+ *  - Input de texto
  *  - Fala as respostas via /api/tts
  */
 export default function Page() {
   // -------- UI / estado
   const [status, setStatus] = useState("Pronto");
   const [isArmed, setIsArmed] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [isRecording, setIsRecording] = useState(false); // hold-to-talk
+  const [isStreaming, setIsStreaming] = useState(false); // streaming WS
 
   const [transcript, setTranscript] = useState("");
   const [answer, setAnswer] = useState("");
@@ -30,16 +30,21 @@ export default function Page() {
 
   const [log, setLog] = useState<LogItem[]>([]);
 
+  // Métricas de streaming
+  const [framesSent, setFramesSent] = useState(0);
+  const [bytesSent, setBytesSent] = useState(0);
+
   // -------- Áudio / gravação
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null); // usado só no modo "hold"
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null); // hold
   const wsRef = useRef<WebSocket | null>(null);
 
   // Web Audio (streaming)
   const audioCtxRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const pcmBufferRef = useRef<Float32Array | null>(null); // acumula float32 antes de resample
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const workletReadyRef = useRef(false);
 
   // player TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -209,7 +214,6 @@ export default function Page() {
 
   async function handleTranscribeAndAnswer(blob: Blob) {
     try {
-      // 1) STT (upload)
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
       fd.append("audio", blob, "audio.webm");
@@ -238,35 +242,27 @@ export default function Page() {
   // ===== STREAMING PCM =====
   // =========================
 
-  // Util: concatena Float32Arrays
-  function concatFloat32(a: Float32Array, b: Float32Array) {
-    const out = new Float32Array(a.length + b.length);
-    out.set(a, 0);
-    out.set(b, a.length);
-    return out;
+  // util: normaliza ws/wss
+  function normalizeWsUrl(u: string) {
+    if (!u) return u;
+    // já tem ws ou wss
+    if (u.startsWith("ws://") || u.startsWith("wss://")) {
+      if (location.protocol === "https:" && u.startsWith("ws://")) {
+        return "wss://" + u.slice("ws://".length);
+      }
+      return u;
+    }
+    // http(s) -> ws(s)
+    if (u.startsWith("http://") || u.startsWith("https://")) {
+      const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+      return scheme + u.replace(/^https?:\/\//, "");
+    }
+    // domínio simples
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    return scheme + u.replace(/^\/\//, "");
   }
 
-  // Downsample simples (linear) para 16 kHz mono
-  function resampleTo16k(float32: Float32Array, fromRate: number): Int16Array {
-    const toRate = 16000;
-    if (fromRate === toRate) {
-      return floatTo16PCM(float32);
-    }
-    const ratio = fromRate / toRate;
-    const newLen = Math.floor(float32.length / ratio);
-    const out = new Float32Array(newLen);
-    let pos = 0;
-    for (let i = 0; i < newLen; i++) {
-      const idx = i * ratio;
-      const i0 = Math.floor(idx);
-      const i1 = Math.min(i0 + 1, float32.length - 1);
-      const w = idx - i0;
-      out[i] = float32[i0] * (1 - w) + float32[i1] * w;
-      pos++;
-    }
-    return floatTo16PCM(out);
-  }
-
+  // Downsample linear para 16k + conversão para PCM16
   function floatTo16PCM(f32: Float32Array): Int16Array {
     const out = new Int16Array(f32.length);
     for (let i = 0; i < f32.length; i++) {
@@ -275,17 +271,57 @@ export default function Page() {
     }
     return out;
   }
-
+  function resampleTo16k(float32: Float32Array, fromRate: number): Int16Array {
+    const toRate = 16000;
+    if (fromRate === toRate) return floatTo16PCM(float32);
+    const ratio = fromRate / toRate;
+    const newLen = Math.floor(float32.length / ratio);
+    const outF32 = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      const idx = i * ratio;
+      const i0 = Math.floor(idx);
+      const i1 = Math.min(i0 + 1, float32.length - 1);
+      const w = idx - i0;
+      outF32[i] = float32[i0] * (1 - w) + float32[i1] * w;
+    }
+    return floatTo16PCM(outF32);
+  }
   function toBase64(int16: Int16Array): string {
-    // Mais rápido: usar Buffer em browsers modernos via Uint8Array + btoa
-    const u8 = new Uint8Array(int16.buffer);
+    const u8 = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
     let binary = "";
-    const chunk = 0x8000;
-    for (let i = 0; i < u8.length; i += chunk) {
-      const sub = u8.subarray(i, i + chunk);
+    const step = 0x8000;
+    for (let i = 0; i < u8.length; i += step) {
+      const sub = u8.subarray(i, i + step);
       binary += String.fromCharCode.apply(null, Array.from(sub) as any);
     }
     return btoa(binary);
+  }
+
+  // Worklet loader inline (sem ficheiros extra)
+  async function ensureWorklet(ctx: AudioContext) {
+    if (workletReadyRef.current) return;
+    const code = `
+      class AlmaCapture extends AudioWorkletProcessor {
+        process (inputs, outputs, parameters) {
+          const input = inputs[0];
+          if (input && input[0]) {
+            // envia cópia do canal 0 ao thread principal
+            const ch = input[0];
+            // copia (os buffers dos worklets são reciclados)
+            const copy = new Float32Array(ch.length);
+            copy.set(ch);
+            this.port.postMessage(copy, [copy.buffer]);
+          }
+          return true;
+        }
+      }
+      registerProcessor('alma-capture', AlmaCapture);
+    `;
+    const blob = new Blob([code], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    workletReadyRef.current = true;
   }
 
   async function startStreamingPCM() {
@@ -299,14 +335,20 @@ export default function Page() {
     }
     if (isStreaming) return;
 
+    // reset métricas
+    setFramesSent(0);
+    setBytesSent(0);
+
     try {
+      const url = normalizeWsUrl(STT_WS_URL);
       setStatus("🔌 A ligar ao STT…");
-      const ws = new WebSocket(STT_WS_URL);
+      const ws = new WebSocket(url);
       wsRef.current = ws;
 
       ws.onopen = async () => {
         setStatus("🟢 Streaming ligado. A enviar áudio (PCM16/16k) …");
-        // envia handshake
+
+        // Handshake
         try {
           ws.send(
             JSON.stringify({
@@ -318,51 +360,79 @@ export default function Page() {
           );
         } catch {}
 
-        // Web Audio pipeline
-        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        // AudioContext
+        const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const ctx: AudioContext = new Ctx();
         audioCtxRef.current = ctx;
 
-        const src = ctx.createMediaStreamSource(streamRef.current!);
-        sourceRef.current = src;
+        // iOS / Safari às vezes ficam "suspended" — garantir resume num gesto
+        try {
+          await ctx.resume();
+        } catch {}
 
-        // ScriptProcessorNode (bufferSize 2048 ou 4096; 1 canal)
-        const bufferSize = 2048;
-        const proc = ctx.createScriptProcessor(bufferSize, 1, 1);
-        processorRef.current = proc;
+        // Worklet preferencial
+        let usedWorklet = false;
+        try {
+          if (ctx.audioWorklet) {
+            await ensureWorklet(ctx);
+            const node = new AudioWorkletNode(ctx, "alma-capture", { numberOfInputs: 1, numberOfOutputs: 0 });
+            workletNodeRef.current = node;
 
-        pcmBufferRef.current = new Float32Array(0);
-        src.connect(proc);
-        proc.connect(ctx.destination); // necessário em iOS para o callback correr (não fará som)
+            const src = ctx.createMediaStreamSource(streamRef.current!);
+            sourceRef.current = src;
+            src.connect(node);
 
-        proc.onaudioprocess = (ev) => {
-          if (!wsRef.current || wsRef.current.readyState !== 1) return;
-          const inBuf = ev.inputBuffer.getChannelData(0); // Float32
-          // acumula
-          const prev = pcmBufferRef.current!;
-          const combined = concatFloat32(prev, inBuf);
-          // queremos enviar em blocos de ~20–40ms @ 16k => 320–640 samples pós-resample
-          // Para simplificar, enviaremos a cada callback tudo o que vier, resample e chunk
-          // (os tamanhos serão pequenos e frequentes).
-          // Resample para 16k
-          const int16 = resampleTo16k(combined, ctx.sampleRate);
-          // Limpa o acumulador (já enviámos tudo)
-          pcmBufferRef.current = new Float32Array(0);
+            node.port.onmessage = (e) => {
+              const f32: Float32Array = e.data;
+              if (!wsRef.current || wsRef.current.readyState !== 1) return;
+              const int16 = resampleTo16k(f32, ctx.sampleRate);
+              if (int16.length === 0) return;
+              // frame de 20ms (~320 samples)
+              const CH = 320;
+              for (let i = 0; i < int16.length; i += CH) {
+                const slice = int16.subarray(i, Math.min(i + CH, int16.length));
+                const b64 = toBase64(slice);
+                try {
+                  const msg = JSON.stringify({ type: "audio", data: b64 });
+                  wsRef.current!.send(msg);
+                  setFramesSent((n) => n + 1);
+                  setBytesSent((n) => n + msg.length);
+                } catch {}
+              }
+            };
 
-          if (int16.length === 0) return;
-
-          // Opcional: chunking de 20ms (320 samples) para quadros mais estáveis
-          const CH = 320; // 20ms @ 16k
-          for (let i = 0; i < int16.length; i += CH) {
-            const slice = int16.subarray(i, Math.min(i + CH, int16.length));
-            if (slice.length === 0) continue;
-            const b64 = toBase64(slice);
-            try {
-              wsRef.current!.send(JSON.stringify({ type: "audio", data: b64 }));
-            } catch (err) {
-              // ignore
-            }
+            usedWorklet = true;
           }
-        };
+        } catch (err) {
+          console.warn("Worklet falhou, cai para ScriptProcessor:", err);
+          usedWorklet = false;
+        }
+
+        if (!usedWorklet) {
+          // Fallback ScriptProcessor
+          const src = ctx.createMediaStreamSource(streamRef.current!);
+          sourceRef.current = src;
+          const proc = ctx.createScriptProcessor(2048, 1, 1);
+          processorRef.current = proc;
+          src.connect(proc);
+          proc.connect(ctx.destination); // necessário em iOS para disparar callbacks
+          proc.onaudioprocess = (ev) => {
+            if (!wsRef.current || wsRef.current.readyState !== 1) return;
+            const inBuf = ev.inputBuffer.getChannelData(0);
+            const int16 = resampleTo16k(inBuf, ctx.sampleRate);
+            const CH = 320;
+            for (let i = 0; i < int16.length; i += CH) {
+              const slice = int16.subarray(i, Math.min(i + CH, int16.length));
+              const b64 = toBase64(slice);
+              try {
+                const msg = JSON.stringify({ type: "audio", data: b64 });
+                wsRef.current!.send(msg);
+                setFramesSent((n) => n + 1);
+                setBytesSent((n) => n + msg.length);
+              } catch {}
+            }
+          };
+        }
 
         setIsStreaming(true);
       };
@@ -375,15 +445,7 @@ export default function Page() {
       ws.onclose = () => {
         setStatus("Streaming fechado.");
         setIsStreaming(false);
-        // limpa áudio
-        try {
-          processorRef.current?.disconnect();
-          sourceRef.current?.disconnect();
-          audioCtxRef.current?.close();
-        } catch {}
-        processorRef.current = null;
-        sourceRef.current = null;
-        audioCtxRef.current = null;
+        cleanupAudioGraph();
       };
 
       ws.onmessage = async (ev) => {
@@ -407,6 +469,28 @@ export default function Page() {
     }
   }
 
+  function cleanupAudioGraph() {
+    try {
+      workletNodeRef.current?.disconnect();
+    } catch {}
+    workletNodeRef.current = null;
+
+    try {
+      processorRef.current?.disconnect();
+    } catch {}
+    processorRef.current = null;
+
+    try {
+      sourceRef.current?.disconnect();
+    } catch {}
+    sourceRef.current = null;
+
+    try {
+      audioCtxRef.current?.close();
+    } catch {}
+    audioCtxRef.current = null;
+  }
+
   function stopStreamingPCM() {
     try {
       if (wsRef.current && wsRef.current.readyState === 1) {
@@ -418,15 +502,7 @@ export default function Page() {
         } catch {}
       }
     } catch {}
-    // fecha audio
-    try {
-      processorRef.current?.disconnect();
-      sourceRef.current?.disconnect();
-      audioCtxRef.current?.close();
-    } catch {}
-    processorRef.current = null;
-    sourceRef.current = null;
-    audioCtxRef.current = null;
+    cleanupAudioGraph();
     setIsStreaming(false);
     setStatus("Streaming parado.");
   }
@@ -478,7 +554,7 @@ export default function Page() {
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
       {/* Controlo de micro + streaming */}
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
         <button
           onClick={requestMic}
           style={{
@@ -533,6 +609,11 @@ export default function Page() {
         >
           Copiar histórico
         </button>
+      </div>
+
+      {/* Métricas de streaming */}
+      <div style={{ fontSize: 12, color: "#aaa", marginBottom: 16 }}>
+        Streaming: frames enviados <b>{framesSent}</b> | bytes aprox. <b>{bytesSent}</b>
       </div>
 
       {/* Entrada por texto */}
