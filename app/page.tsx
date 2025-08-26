@@ -14,7 +14,7 @@ import React, { useEffect, useRef, useState } from "react";
  */
 
 export default function Page() {
-  // --- UI base (como tinhas)
+  // --- UI base
   const [status, setStatus] = useState<string>("Pronto");
   const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -22,11 +22,11 @@ export default function Page() {
   const [answer, setAnswer] = useState<string>("");
   const [typed, setTyped] = useState("");
 
-  // --- Streaming STT extra
+  // --- Streaming STT
   const [isStreaming, setIsStreaming] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState("");
 
-  // --- Audio / Recorder refs (iguais aos teus)
+  // --- Audio / Recorder refs
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -34,7 +34,7 @@ export default function Page() {
   // --- TTS audio
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // cria <audio> p/ TTS (igual ao teu, com playsInline no iOS)
+  // cria <audio> p/ TTS (iOS playsInline)
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true;
@@ -67,7 +67,7 @@ export default function Page() {
     };
   }, []);
 
-  // ---- MIC igual ao teu
+  // ---- MIC
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
@@ -78,14 +78,14 @@ export default function Page() {
       streamRef.current = stream;
       setIsArmed(true);
       setStatus("Micro pronto. Mantém o botão para falar.");
-    } catch (e: any) {
+    } catch {
       setStatus(
         "⚠️ Permissão do micro negada. Abre as definições do navegador e permite acesso ao micro."
       );
     }
   }
 
-  // ---- HOLD (o teu fluxo original)
+  // ---- HOLD
   function startHold() {
     if (!isArmed) {
       requestMic();
@@ -136,7 +136,7 @@ export default function Page() {
 
   async function handleTranscribeAndAnswer(blob: Blob) {
     try {
-      // 1) STT (igual ao teu)
+      // 1) STT
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
       fd.append("audio", blob, "audio.webm");
@@ -157,31 +157,14 @@ export default function Page() {
         return;
       }
 
-      // 2) ALMA
-      setStatus("🧠 A perguntar à Alma…");
-      const almaResp = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: said }),
-      });
-      if (!almaResp.ok) {
-        const txt = await almaResp.text();
-        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
-        return;
-      }
-      const almaJson = (await almaResp.json()) as { answer?: string };
-      const out = (almaJson.answer || "").trim();
-      setAnswer(out);
-      setStatus("🔊 A falar…");
-
-      // 3) TTS
-      await speak(out);
-      setStatus("Pronto");
+      // 2) ALMA + TTS (usa helper)
+      await askAlma(said);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
+  // ---- TTS helper
   async function speak(text: string) {
     if (!text) return;
     try {
@@ -215,19 +198,14 @@ export default function Page() {
     }
   }
 
-  // ---- Texto escrito (igual)
-  async function sendTyped() {
-    const q = typed.trim();
-    if (!q) return;
+  // ---- Perguntar à Alma + falar (faltava isto)
+  async function askAlma(question: string) {
     setStatus("🧠 A perguntar à Alma…");
-    setTranscript(q);
-    setAnswer("");
-
     try {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q }),
+        body: JSON.stringify({ question }),
       });
       if (!almaResp.ok) {
         const txt = await almaResp.text();
@@ -240,10 +218,19 @@ export default function Page() {
       setStatus("🔊 A falar…");
       await speak(out);
       setStatus("Pronto");
-      setTyped("");
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
     }
+  }
+
+  // ---- Texto escrito
+  async function sendTyped() {
+    const q = typed.trim();
+    if (!q) return;
+    setTranscript(q);
+    setAnswer("");
+    await askAlma(q);
+    setTyped("");
   }
 
   // =========================
@@ -274,8 +261,7 @@ export default function Page() {
         setIsStreaming(true);
         setLiveTranscript("");
 
-        // (Opcional) handshake/config para o teu proxy STT
-        // Ex.: ws.send(JSON.stringify({ type: "start", format: "webm_opus", lang: "pt-PT" }));
+        // (Opcional) handshake para o teu proxy STT
         try {
           ws.send(JSON.stringify({ type: "start", format: "webm_opus", lang: "pt-PT" }));
         } catch {}
@@ -291,8 +277,7 @@ export default function Page() {
 
         mr.ondataavailable = async (e) => {
           if (e.data && e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-            // Envia blob diretamente (browsers WS aceitam Blob)
-            ws.send(e.data);
+            ws.send(e.data); // Blob direto
           }
         };
         mr.onstop = () => {
@@ -300,7 +285,7 @@ export default function Page() {
         };
         mr.start(250);
 
-        // ping keepalive (se o proxy fechar por inatividade)
+        // ping keepalive
         pingTimerRef.current = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
             try {
@@ -320,7 +305,6 @@ export default function Page() {
             setLiveTranscript(msg.transcript);
           }
           if (msg.is_final && msg.transcript) {
-            // Pergunta à Alma e fala
             await askAlma(msg.transcript);
           }
         } catch (e) {
@@ -365,7 +349,7 @@ export default function Page() {
     }
   }
 
-  // Touch handlers (iguais)
+  // Touch handlers
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -385,10 +369,12 @@ export default function Page() {
           '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
       }}
     >
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto (com Streaming)</h1>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
+        🎭 Alma — Voz & Texto (com Streaming)
+      </h1>
       <p style={{ opacity: 0.8, marginBottom: 16 }}>{status}</p>
 
-      {/* Controlo de micro (igual) */}
+      {/* Controlo de micro */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -448,7 +434,7 @@ export default function Page() {
         )}
       </div>
 
-      {/* Entrada por texto (igual) */}
+      {/* Entrada por texto */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
           value={typed}
@@ -480,7 +466,7 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Conversa simples (igual) */}
+      {/* Conversa simples */}
       <div
         style={{
           border: "1px solid #333",
@@ -516,7 +502,8 @@ export default function Page() {
           {isStreaming ? liveTranscript || "…" : "—"}
         </div>
         <div style={{ opacity: 0.7, fontSize: 12, marginTop: 6 }}>
-          * Quando o servidor enviar <code>is_final: true</code>, a Alma responde e fala automaticamente.
+          * Quando o servidor enviar <code>is_final: true</code>, a Alma responde e fala
+          automaticamente.
         </div>
       </div>
     </main>
