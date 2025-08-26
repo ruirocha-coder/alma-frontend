@@ -2,104 +2,148 @@
 
 import React, { useEffect, useRef, useState } from "react";
 
-/**
- * Mantém:
- *  - Botão "Ativar micro"
- *  - Hold-to-talk (usa /api/stt -> /api/alma -> /api/tts)
- *  - Caixa de texto (usa /api/alma -> /api/tts)
- *
- * Acrescenta:
- *  - Streaming (beta): envia chunks do MediaRecorder por WebSocket em BASE64 JSON
- *    Estrutura enviada: { type: "audio", data: "<base64>" }
- *    Mensagens esperadas do WS: { transcript, is_final, error? }
- */
+type LogItem = { role: "you" | "alma"; text: string };
+
+const STT_WS_URL =
+  (typeof window !== "undefined" && (window as any).env?.NEXT_PUBLIC_STT_WS_URL) ||
+  process.env.NEXT_PUBLIC_STT_WS_URL ||
+  "";
+
+/** ---------- Helpers de áudio (PCM16 16k base64) ---------- */
+
+/** Downsample Float32 PCM para 16 kHz (simples e leve) */
+function downsampleTo16kPCM(float32: Float32Array, inRate: number): Int16Array {
+  const outRate = 16000;
+  if (inRate === outRate) {
+    // só converter para int16
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+
+  const ratio = inRate / outRate;
+  const newLen = Math.floor(float32.length / ratio);
+  const out = new Int16Array(newLen);
+
+  let pos = 0;
+  for (let i = 0; i < newLen; i++) {
+    const idx = i * ratio;
+    const idx0 = Math.floor(idx);
+    const idx1 = Math.min(idx0 + 1, float32.length - 1);
+    const frac = idx - idx0;
+    const samp = float32[idx0] * (1 - frac) + float32[idx1] * frac;
+
+    const s = Math.max(-1, Math.min(1, samp));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    pos++;
+  }
+  return out;
+}
+
+/** Converte Blob (webm/mp4) → PCM16 16k base64 */
+async function blobToPCM16Base64(blob: Blob): Promise<string> {
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  const ch = audioBuffer.getChannelData(0); // mono
+  const pcm16 = downsampleTo16kPCM(ch, audioBuffer.sampleRate);
+
+  // PCM16 → base64
+  let binary = "";
+  const bytes = new Uint8Array(pcm16.buffer);
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+/** Escolhe mimeType suportado pelo MediaRecorder */
+function chooseMime(): string {
+  if (typeof MediaRecorder === "undefined") return "audio/webm;codecs=opus";
+  if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
+  if (MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
+  return "audio/mp4"; // fallback Safari
+}
+
+/** Cria MediaRecorder com meta do mime em __mime */
+function buildMediaRecorder(stream: MediaStream): MediaRecorder {
+  const mime = chooseMime();
+  const mr = new MediaRecorder(stream, { mimeType: mime });
+  (mr as any).__mime = mime;
+  return mr;
+}
+
+/** -------------------------------------------------------- */
 
 export default function Page() {
-  // --- UI state
-  const [status, setStatus] = useState<string>("Pronto");
-  const [isArmed, setIsArmed] = useState(false); // micro ativado
+  // -------- UI / estado
+  const [status, setStatus] = useState("Pronto");
+  const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [transcript, setTranscript] = useState<string>("");
-  const [answer, setAnswer] = useState<string>("");
+  const [isStreaming, setIsStreaming] = useState(false);
 
-  // histórico simples (para poderes copiar)
-  const [history, setHistory] = useState<{ me: string; alma: string }[]>([]);
-
-  // entrada por texto
+  const [transcript, setTranscript] = useState("");
+  const [answer, setAnswer] = useState("");
   const [typed, setTyped] = useState("");
 
-  // --- Audio / Recorder refs (HOLD)
+  const [log, setLog] = useState<LogItem[]>([]);
+
+  // -------- Áudio / gravação
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
-
-  // --- Streaming WS
   const wsRef = useRef<WebSocket | null>(null);
-  const streamingStreamRef = useRef<MediaStream | null>(null);
-  const streamingRecorderRef = useRef<MediaRecorder | null>(null);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const WS_URL = process.env.NEXT_PUBLIC_STT_WS_URL;
+  const requestTimerRef = useRef<any>(null);
 
-  // Audio element para TTS
+  // player TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // cria o <audio> de TTS uma vez
+  // cria <audio> e desbloqueia iOS
   useEffect(() => {
     const a = new Audio();
-    (a as any).playsInline = true; // iOS
+    (a as any).playsInline = true;
     a.autoplay = false;
     a.preload = "auto";
     ttsAudioRef.current = a;
 
-    // desbloqueio de áudio em iOS
-    const unlockAudio = () => {
+    const unlock = () => {
       if (!ttsAudioRef.current) return;
-      try {
-        ttsAudioRef.current.muted = true;
-        ttsAudioRef.current
-          .play()
-          .then(() => {
-            ttsAudioRef.current!.pause();
-            ttsAudioRef.current!.currentTime = 0;
-            ttsAudioRef.current!.muted = false;
-          })
-          .catch(() => {});
-      } catch {}
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      const el = ttsAudioRef.current;
+      el.muted = true;
+      el.play().then(() => {
+        el.pause();
+        el.currentTime = 0;
+        el.muted = false;
+      }).catch(() => {});
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
-    document.addEventListener("click", unlockAudio, { once: true });
-    document.addEventListener("touchstart", unlockAudio, { once: true });
+    document.addEventListener("click", unlock, { once: true });
+    document.addEventListener("touchstart", unlock, { once: true });
 
     return () => {
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
   }, []);
 
-  // --- Helpers comuns
-
+  // -------- Helpers de micro
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          noiseSuppression: true,
-          echoCancellation: false,
-        },
+        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
         video: false,
       });
       streamRef.current = stream;
       setIsArmed(true);
-      setStatus("Micro pronto. Mantém o botão para falar.");
+      setStatus("Micro pronto. Mantém o botão para falar ou inicia streaming.");
     } catch (e: any) {
-      setStatus(
-        "⚠️ Permissão do micro negada. Abre as definições do navegador e permite acesso ao micro."
-      );
+      setStatus("⚠️ Permissão negada. Ativa o micro nas definições do navegador.");
     }
   }
 
+  // -------- TTS
   async function speak(text: string) {
     if (!text) return;
     try {
@@ -122,7 +166,6 @@ export default function Page() {
         setStatus("⚠️ Áudio não inicializado.");
         return;
       }
-
       audio.src = url;
       try {
         await audio.play();
@@ -134,32 +177,36 @@ export default function Page() {
     }
   }
 
-  async function askAlmaAndSpeak(q: string) {
-    // pergunta à Alma e fala
-    setStatus("🧠 A perguntar à Alma…");
-    setTranscript(q);
-    setAnswer("");
+  // -------- Alma
+  async function askAlma(question: string) {
+    setTranscript(question);
+    setLog((l) => [...l, { role: "you", text: question }]);
 
-    const almaResp = await fetch("/api/alma", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: q }),
-    });
-    if (!almaResp.ok) {
-      const txt = await almaResp.text();
-      setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
-      return;
+    setStatus("🧠 A perguntar à Alma…");
+    try {
+      const r = await fetch("/api/alma", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
+        return;
+      }
+      const j = (await r.json()) as { answer?: string };
+      const out = (j.answer || "").trim();
+      setAnswer(out);
+      setLog((l) => [...l, { role: "alma", text: out }]);
+      setStatus("🔊 A falar…");
+      await speak(out);
+      setStatus("Pronto");
+    } catch (e: any) {
+      setStatus("⚠️ Erro: " + (e?.message || e));
     }
-    const almaJson = (await almaResp.json()) as { answer?: string };
-    const out = (almaJson.answer || "").trim();
-    setAnswer(out);
-    setHistory((h) => [...h, { me: q, alma: out }]);
-    setStatus("🔊 A falar…");
-    await speak(out);
-    setStatus("Pronto");
   }
 
-  // --- HOLD TO TALK (igual ao teu, sem mexer no fluxo REST)
+  // -------- Fluxo “segurar para falar”
   function startHold() {
     if (!isArmed) {
       requestMic();
@@ -171,28 +218,17 @@ export default function Page() {
     }
     try {
       setStatus("🎙️ A gravar…");
-      chunksRef.current = [];
-
-      const mime =
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "audio/mp4"; // fallback Safari
-
-      const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
+      const mr = buildMediaRecorder(streamRef.current!);
       mediaRecorderRef.current = mr;
 
+      const chunks: BlobPart[] = [];
       mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
+        if (e.data && e.data.size > 0) chunks.push(e.data);
       };
       mr.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: mr.mimeType });
+        const blob = new Blob(chunks, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
       };
-
       mr.start();
       setIsRecording(true);
     } catch (e: any) {
@@ -210,7 +246,7 @@ export default function Page() {
 
   async function handleTranscribeAndAnswer(blob: Blob) {
     try {
-      // 1) STT (REST)
+      // 1) STT (upload)
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
       fd.append("audio", blob, "audio.webm");
@@ -225,159 +261,133 @@ export default function Page() {
       }
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
-      setTranscript(said);
       if (!said) {
-        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar um pouco mais perto.");
+        setStatus("⚠️ Não consegui transcrever o áudio. Fala mais perto do micro.");
         return;
       }
-
-      await askAlmaAndSpeak(said);
+      await askAlma(said);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
-  // --- STREAMING (beta) via WS -> envia base64 de cada chunk do MediaRecorder
-  async function startStreaming() {
-    if (!WS_URL) {
-      setStatus("⚠️ Falta NEXT_PUBLIC_STT_WS_URL.");
+  // -------- Streaming WebSocket (PCM16 base64 16k)
+  async function toggleStreaming() {
+    if (isStreaming) {
+      try { mediaRecorderRef.current?.stop(); } catch {}
+      try { wsRef.current?.close(); } catch {}
+      if (requestTimerRef.current) clearInterval(requestTimerRef.current);
+      setIsStreaming(false);
+      setStatus("Streaming parado.");
       return;
     }
-    if (isStreaming) return;
+
+    if (!isArmed) {
+      await requestMic();
+      if (!streamRef.current) return;
+    }
+    if (!STT_WS_URL) {
+      setStatus("⚠️ NEXT_PUBLIC_STT_WS_URL não definido.");
+      return;
+    }
 
     try {
-      // micro dedicado ao streaming (não mexe no hold)
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          noiseSuppression: true,
-          echoCancellation: false,
-        },
-        video: false,
-      });
-      streamingStreamRef.current = stream;
-
-      const ws = new WebSocket(WS_URL);
-      wsRef.current = ws;
+      setStatus("🔌 A ligar ao STT…");
+      const ws = new WebSocket(STT_WS_URL);
+      ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
-        setStatus("🔌 WS ligado. A enviar áudio em base64…");
-        setIsStreaming(true);
+        setStatus("🟢 Streaming ligado. A enviar áudio…");
 
-        // arrancar MediaRecorder só após WS aberto
-        const mime =
-          MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-            ? "audio/webm;codecs=opus"
-            : MediaRecorder.isTypeSupported("audio/webm")
-            ? "audio/webm"
-            : "audio/mp4";
-
-        const mr = new MediaRecorder(stream, { mimeType: mime });
-        streamingRecorderRef.current = mr;
-
-        mr.ondataavailable = (e) => {
-          if (!e.data || e.data.size === 0) return;
-          if (!wsRef.current || wsRef.current.readyState !== 1) return;
-
-          // Envia cada chunk como base64 JSON
-          e.data.arrayBuffer().then((buf) => {
-            const b64 = base64FromArrayBuffer(buf);
-            const payload = JSON.stringify({ type: "audio", data: b64 });
-            try {
-              wsRef.current!.send(payload);
-            } catch (err) {
-              console.warn("[WS] send falhou:", err);
-            }
-          });
-        };
-
-        // reduzir latência: pedir blobs frequentes
-        mr.start(250); // 250ms por chunk
+        // envia START como PCM16 16k
+        const hello = { type: "start", language: "pt-PT", format: "pcm16", sampleRate: 16000 };
+        try {
+          ws.send(JSON.stringify(hello));
+          console.log("[WS] start ->", hello);
+        } catch (e) {
+          console.warn("[WS] falha a enviar start:", e);
+        }
       };
 
-      ws.onmessage = async (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg?.error) {
-            setStatus("⚠️ WS: " + msg.error);
-            return;
-          }
-          if (typeof msg?.transcript === "string") {
-            setTranscript(msg.transcript);
-          }
-          if (msg?.is_final && msg?.transcript) {
-            // final — pergunta à Alma + TTS
-            await askAlmaAndSpeak(msg.transcript);
-          }
-        } catch (e) {
-          console.warn("[WS] onmessage parse error:", e);
-        }
+      ws.onerror = (ev) => {
+        console.warn("[WS] erro", ev);
+        setStatus("⚠️ Erro no WebSocket STT.");
       };
 
       ws.onclose = () => {
-        setStatus("🔌 WS fechado.");
+        setStatus("Streaming fechado.");
         setIsStreaming(false);
-        cleanupStreaming();
+        try { mediaRecorderRef.current?.stop(); } catch {}
+        if (requestTimerRef.current) clearInterval(requestTimerRef.current);
       };
 
-      ws.onerror = (e) => {
-        console.warn("[WS] erro:", e);
-        setStatus("⚠️ Erro no WS.");
-      };
-    } catch (e: any) {
-      setStatus("⚠️ Não foi possível iniciar streaming: " + (e?.message || e));
-      cleanupStreaming();
-    }
-  }
-
-  function stopStreaming() {
-    if (!isStreaming) return;
-    if (streamingRecorderRef.current && streamingRecorderRef.current.state !== "inactive") {
-      streamingRecorderRef.current.stop();
-    }
-    if (wsRef.current && wsRef.current.readyState === 1) {
-      // envia sinal de fim (se o servidor suportar)
-      try {
-        wsRef.current.send(JSON.stringify({ type: "end" }));
-      } catch {}
-      wsRef.current.close();
-    }
-    cleanupStreaming();
-    setIsStreaming(false);
-    setStatus("Streaming parado.");
-  }
-
-  function cleanupStreaming() {
-    if (streamingRecorderRef.current) {
-      try {
-        if (streamingRecorderRef.current.state !== "inactive") {
-          streamingRecorderRef.current.stop();
+      ws.onmessage = async (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "partial" && msg.transcript) {
+              setTranscript(msg.transcript);
+            } else if ((msg.type === "final" || msg.is_final) && msg.transcript) {
+              setTranscript(msg.transcript);
+              await askAlma(msg.transcript);
+            } else if (msg.type === "error") {
+              setStatus("⚠️ STT (WS): " + msg.error);
+            }
+          } catch {
+            // ignora strings não-JSON (pings)
+          }
         }
-      } catch {}
-      streamingRecorderRef.current = null;
-    }
-    if (streamingStreamRef.current) {
-      for (const t of streamingStreamRef.current.getTracks()) t.stop();
-      streamingStreamRef.current = null;
-    }
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch {}
-      wsRef.current = null;
+      };
+
+      wsRef.current = ws;
+
+      // MediaRecorder a mandar chunks => convertemos para PCM16 base64 16k e enviamos JSON
+      const mr = buildMediaRecorder(streamRef.current!);
+      mediaRecorderRef.current = mr;
+
+      mr.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        if (!wsRef.current || wsRef.current.readyState !== 1) return;
+
+        blobToPCM16Base64(e.data).then((b64) => {
+          try {
+            wsRef.current!.send(JSON.stringify({ type: "audio", data: b64 }));
+          } catch (err) {
+            console.warn("[WS] send falhou:", err);
+          }
+        }).catch((err) => {
+          console.warn("[WS] decode falhou:", err);
+        });
+      };
+
+      mr.onstop = () => {
+        if (wsRef.current && wsRef.current.readyState === 1) {
+          try { wsRef.current.send(JSON.stringify({ type: "stop" })); } catch {}
+        }
+      };
+
+      // arrancar (timeslice + requestData fallback)
+      mr.start(250);
+      requestTimerRef.current = setInterval(() => {
+        try { mr.requestData(); } catch {}
+      }, 250);
+
+      setIsStreaming(true);
+      setStatus("🎧 Streaming a decorrer…");
+    } catch (e: any) {
+      setStatus("⚠️ Falha a iniciar streaming: " + (e?.message || e));
     }
   }
 
-  // util: ArrayBuffer -> base64
-  function base64FromArrayBuffer(buf: ArrayBuffer) {
-    let binary = "";
-    const bytes = new Uint8Array(buf);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
-    return btoa(binary);
+  // -------- Texto → Alma
+  async function sendTyped() {
+    const q = typed.trim();
+    if (!q) return;
+    setTyped("");
+    await askAlma(q);
   }
 
-  // Touch handlers para iOS (segurar)
+  // -------- UI
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -387,20 +397,31 @@ export default function Page() {
     stopHold();
   }
 
+  function copyLog() {
+    const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
+    navigator.clipboard.writeText(txt).then(() => {
+      setStatus("Histórico copiado.");
+      setTimeout(() => setStatus("Pronto"), 1200);
+    });
+  }
+
   return (
     <main
       style={{
-        maxWidth: 720,
+        maxWidth: 820,
         margin: "0 auto",
         padding: 16,
         fontFamily:
           '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
+        color: "#fff",
+        background: "#0b0b0b",
+        minHeight: "100vh",
       }}
     >
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto</h1>
-      <p style={{ opacity: 0.8, marginBottom: 16 }}>{status}</p>
+      <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
-      {/* Controlo de micro (hold) */}
+      {/* Controlo de micro + streaming */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -413,6 +434,19 @@ export default function Page() {
           }}
         >
           {isArmed ? "Micro pronto ✅" : "Ativar micro"}
+        </button>
+
+        <button
+          onClick={toggleStreaming}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #444",
+            background: isStreaming ? "#004488" : "#333",
+            color: "#fff",
+          }}
+        >
+          {isStreaming ? "⏹️ Parar streaming" : "🔴 Iniciar streaming"}
         </button>
 
         <button
@@ -430,49 +464,19 @@ export default function Page() {
         >
           {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
         </button>
-      </div>
 
-      {/* Streaming (beta) */}
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          flexWrap: "wrap",
-          marginBottom: 16,
-          border: "1px dashed #333",
-          padding: 12,
-          borderRadius: 8,
-        }}
-      >
         <button
-          onClick={startStreaming}
-          disabled={isStreaming}
+          onClick={copyLog}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
             border: "1px solid #444",
-            background: isStreaming ? "#113311" : "#222",
-            color: isStreaming ? "#9BE29B" : "#fff",
+            background: "#222",
+            color: "#ddd",
           }}
         >
-          {isStreaming ? "Streaming ON ✅" : "Iniciar streaming (beta)"}
+          Copiar histórico
         </button>
-        <button
-          onClick={stopStreaming}
-          disabled={!isStreaming}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: !isStreaming ? "#333" : "#8b0000",
-            color: "#fff",
-          }}
-        >
-          Parar streaming
-        </button>
-        <div style={{ fontSize: 12, opacity: 0.8 }}>
-          Envia chunks base64 por WS ({WS_URL || "WS URL em falta"})
-        </div>
       </div>
 
       {/* Entrada por texto */}
@@ -513,80 +517,33 @@ export default function Page() {
           border: "1px solid #333",
           borderRadius: 12,
           padding: 12,
-          background: "#0b0b0b",
-          marginBottom: 12,
+          background: "#0f0f0f",
         }}
       >
         <div style={{ marginBottom: 8 }}>
-          <div style={{ fontWeight: 600, color: "#aaa" }}>Tu:</div>
+          <div style={{ fontWeight: 600, color: "#aaa" }}>Tu (último):</div>
           <div style={{ whiteSpace: "pre-wrap" }}>{transcript || "—"}</div>
         </div>
-        <div>
-          <div style={{ fontWeight: 600, color: "#aaa" }}>Alma:</div>
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ fontWeight: 600, color: "#aaa" }}>Alma (último):</div>
           <div style={{ whiteSpace: "pre-wrap" }}>{answer || "—"}</div>
         </div>
-      </div>
 
-      {/* Histórico para copiar */}
-      <div
-        style={{
-          border: "1px solid #222",
-          borderRadius: 12,
-          padding: 12,
-          background: "#0a0a0a",
-        }}
-      >
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>Histórico</div>
-        {history.length === 0 ? (
-          <div style={{ opacity: 0.7 }}>—</div>
-        ) : (
-          <div
-            style={{
-              display: "grid",
-              gap: 8,
-              maxHeight: 300,
-              overflowY: "auto",
-              paddingRight: 6,
-            }}
-          >
-            {history.map((h, i) => (
-              <div key={i} style={{ borderBottom: "1px solid #1b1b1b", paddingBottom: 8 }}>
-                <div style={{ color: "#9bd", marginBottom: 4 }}>Tu:</div>
-                <div style={{ whiteSpace: "pre-wrap" }}>{h.me}</div>
-                <div style={{ color: "#bd9", margin: "8px 0 4px" }}>Alma:</div>
-                <div style={{ whiteSpace: "pre-wrap" }}>{h.alma}</div>
+        <hr style={{ borderColor: "#222", margin: "8px 0 12px" }} />
+
+        <div>
+          <div style={{ fontWeight: 600, color: "#aaa", marginBottom: 6 }}>Histórico</div>
+          <div style={{ display: "grid", gap: 6 }}>
+            {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
+            {log.map((m, i) => (
+              <div key={i} style={{ whiteSpace: "pre-wrap" }}>
+                <span style={{ color: "#999" }}>{m.role === "you" ? "Tu:" : "Alma:"}</span>{" "}
+                {m.text}
               </div>
             ))}
           </div>
-        )}
-        {history.length > 0 && (
-          <button
-            onClick={() => {
-              const txt = history
-                .map((h) => `Tu: ${h.me}\nAlma: ${h.alma}`)
-                .join("\n\n----------------\n\n");
-              navigator.clipboard.writeText(txt).catch(() => {});
-            }}
-            style={{
-              marginTop: 8,
-              padding: "8px 12px",
-              borderRadius: 8,
-              border: "1px solid #333",
-              background: "#1b1b1b",
-              color: "#eee",
-            }}
-          >
-            Copiar histórico
-          </button>
-        )}
+        </div>
       </div>
     </main>
   );
-
-  async function sendTyped() {
-    const q = typed.trim();
-    if (!q) return;
-    setTyped("");
-    await askAlmaAndSpeak(q);
-  }
 }
