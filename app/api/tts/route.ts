@@ -1,64 +1,59 @@
 // app/api/tts/route.ts
-import { NextRequest } from "next/server";
-
-export const dynamic = "force-dynamic"; // sem cache
-export const runtime = "nodejs";        // garante Node (binário)
+import { NextRequest, NextResponse } from "next/server";
 
 export async function POST(req: NextRequest) {
+  const KEY = process.env.ELEVENLABS_API_KEY;
+  const VOICE_ID = process.env.ELEVENLABS_VOICE_ID; // <- usa a tua
+  const MODEL = process.env.ELEVENLABS_TTS_MODEL || "eleven_turbo_v2_5"; // seguro p/ planos pagos
+
+  if (!KEY) {
+    return NextResponse.json({ error: "ELEVENLABS_API_KEY em falta" }, { status: 500 });
+  }
+  if (!VOICE_ID) {
+    return NextResponse.json({ error: "ELEVENLABS_VOICE_ID em falta" }, { status: 500 });
+  }
+
+  let text = "";
   try {
-    const { text, voiceId: bodyVoiceId } = (await req.json()) || {};
-    const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || "";
-    const ENV_VOICE = process.env.ELEVENLABS_VOICE_ID || "";
-    const voiceId = (bodyVoiceId || ENV_VOICE || "").trim();
+    const body = await req.json();
+    text = (body?.text || "").toString();
+  } catch {}
+  if (!text) {
+    return NextResponse.json({ error: "Campo 'text' vazio" }, { status: 400 });
+  }
 
-    if (!ELEVEN_API_KEY) {
-      return new Response("ELEVENLABS_API_KEY em falta", { status: 500 });
-    }
-    if (!voiceId) {
-      return new Response("VOICE_ID em falta (env ELEVENLABS_VOICE_ID ou body.voiceId)", {
-        status: 400,
-      });
-    }
-    if (!text || typeof text !== "string") {
-      return new Response("Campo 'text' vazio", { status: 400 });
-    }
+  try {
+    // endpoint padrão (não-streaming) a devolver MP3
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}?optimize_streaming_latency=0&output_format=mp3_44100_128`;
 
-    const url =
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
-        voiceId
-      )}/stream?optimize_streaming_latency=3&output_format=mp3_22050`;
-
-    const r = await fetch(url, {
+    const upstream = await fetch(url, {
       method: "POST",
       headers: {
-        "xi-api-key": ELEVEN_API_KEY,
+        "xi-api-key": KEY,
         "Content-Type": "application/json",
+        // Aceitar áudio garante que a ElevenLabs responde com binário se tudo ok
         Accept: "audio/mpeg",
-        "User-Agent": "alma-frontend/1.0",
       },
       body: JSON.stringify({
         text,
-        // podes trocar de modelo se quiseres
-        model_id: "eleven_turbo_v2_5",
-        voice_settings: { stability: 0.4, similarity_boost: 0.8 },
+        model_id: MODEL, // mantém explícito
+        // podes pôr "voice_settings" aqui se precisares (stability, similarity, etc.)
       }),
+      // evitar quaisquer caches intermédios
       cache: "no-store",
     });
 
-    if (!r.ok) {
-      const errTxt = await r.text().catch(() => "");
-      // Log no server para veres em Railway > Logs
-      console.error("[/api/tts] ElevenLabs ERROR", {
-        status: r.status,
-        statusText: r.statusText,
-        body: errTxt?.slice(0, 2000),
-      });
-      // devolvemos a mensagem real para o frontend mostrar
-      return new Response(errTxt || `Upstream error ${r.status}`, { status: r.status });
+    if (!upstream.ok) {
+      const msg = await upstream.text().catch(() => "");
+      // devolvemos a mensagem original da ElevenLabs para debugging
+      return NextResponse.json(
+        { error: `TTS ${upstream.status}`, details: safeSlice(msg, 2000) },
+        { status: upstream.status }
+      );
     }
 
-    const ab = await r.arrayBuffer();
-    return new Response(ab, {
+    // Pass-through do binário (mp3)
+    return new Response(upstream.body, {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
@@ -66,7 +61,17 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (e: any) {
-    console.error("[/api/tts] exception", e);
-    return new Response(`TTS exception: ${e?.message || e}`, { status: 500 });
+    return NextResponse.json(
+      { error: "Falha no TTS", details: e?.message || String(e) },
+      { status: 502 }
+    );
+  }
+}
+
+function safeSlice(s: string, n: number) {
+  try {
+    return (s || "").slice(0, n);
+  } catch {
+    return "";
   }
 }
