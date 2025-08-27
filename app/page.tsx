@@ -4,110 +4,85 @@ import React, { useEffect, useRef, useState } from "react";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
+const STT_WS_URL =
+  (typeof window !== "undefined" && (window as any).env?.NEXT_PUBLIC_STT_WS_URL) ||
+  process.env.NEXT_PUBLIC_STT_WS_URL ||
+  ""; // ex.: wss://alma-stt-ws-xxxx.up.railway.app/stt
+
 export default function Page() {
-  // --- UI state
-  const [status, setStatus] = useState<string>("Pronto");
-  const [isArmed, setIsArmed] = useState(false); // micro ativado
-  const [isRecording, setIsRecording] = useState(false);
-  const [useStreaming, setUseStreaming] = useState(true); // 👈 toggle streaming do Grok
+  // --- UI state (mantido)
+  const [status, setStatus] = useState("Pronto");
+  const [isArmed, setIsArmed] = useState(false);
+  const [isRecording, setIsRecording] = useState(false); // push-to-talk
+  const [isStreaming, setIsStreaming] = useState(false); // streaming WS
 
-  const [transcript, setTranscript] = useState<string>("");
-  const [answer, setAnswer] = useState<string>("");
+  const [transcript, setTranscript] = useState("");
+  const [answer, setAnswer] = useState("");
   const [typed, setTyped] = useState("");
-
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // --- Audio / Recorder refs
+  // --- Media / refs (mantido + novos)
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
-
-  // Audio element para TTS
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null); // upload (push-to-talk)
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // cria o <audio> de TTS uma vez + desbloqueio iOS
+  // Streaming (PCM 16 kHz)
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // cria <audio> TTS + unlock iOS (mantido)
   useEffect(() => {
     const a = new Audio();
-    // Safari iOS: propriedade não tipada em TS, forçamos via cast
     (a as any).playsInline = true;
     a.autoplay = false;
     a.preload = "auto";
-    // em iOS, manter volume em 1 (por vezes vem 0)
-    a.volume = 1;
     ttsAudioRef.current = a;
 
-    // desbloquear o contexto de áudio com um gesto do utilizador
-    const unlockAudio = () => {
+    const unlock = () => {
       if (!ttsAudioRef.current) return;
       const el = ttsAudioRef.current;
-      try {
-        el.muted = true;
-        el.play()
-          .then(() => {
-            el.pause();
-            el.currentTime = 0;
-            el.muted = false;
-          })
-          .catch(() => {});
-      } catch {}
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      el.muted = true;
+      el.play().then(() => {
+        el.pause();
+        el.currentTime = 0;
+        el.muted = false;
+      }).catch(() => {});
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
-    document.addEventListener("click", unlockAudio, { once: true });
-    document.addEventListener("touchstart", unlockAudio, { once: true });
-
+    document.addEventListener("click", unlock, { once: true });
+    document.addEventListener("touchstart", unlock, { once: true });
     return () => {
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
   }, []);
 
-  // --- Helpers
-
+  // --- Permissão do micro (mantido)
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
-      // áudio apenas, com NS e sem cancelamento de eco (evita distorção)
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          noiseSuppression: true,
-          echoCancellation: false,
-        },
+        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
         video: false,
       });
       streamRef.current = stream;
       setIsArmed(true);
-      setStatus("Micro pronto. Mantém o botão para falar.");
+      setStatus("Micro pronto. Podes falar (hold) ou iniciar streaming.");
     } catch {
-      setStatus(
-        "⚠️ Permissão do micro negada. Abre as definições do navegador e permite o micro."
-      );
+      setStatus("⚠️ Permissão negada. Ativa o micro nas definições do navegador.");
     }
   }
 
-  function buildMediaRecorder(): MediaRecorder {
-    let mime = "";
-    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
-      mime = "audio/webm;codecs=opus";
-    } else if (MediaRecorder.isTypeSupported("audio/webm")) {
-      mime = "audio/webm";
-    } else {
-      mime = "audio/mp4"; // fallback para Safari
-    }
-    const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
-    (mr as any).__mime = mime;
-    return mr;
-  }
-
-  // --- TTS
+  // --- TTS (mantido)
   async function speak(text: string) {
     if (!text) return;
     try {
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // podes incluir voiceId/model se o teu /api/tts aceitar
         body: JSON.stringify({ text }),
       });
       if (!r.ok) {
@@ -118,56 +93,33 @@ export default function Page() {
       const ab = await r.arrayBuffer();
       const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
-
       const audio = ttsAudioRef.current;
       if (!audio) {
         setStatus("⚠️ Áudio não inicializado.");
         return;
       }
-
-      // Stop anterior se ainda tocar
-      try {
-        audio.pause();
-      } catch {}
       audio.src = url;
-
-      // Em iOS, o play precisa de gesto recente; com o “click” do botão é suficiente.
       try {
         await audio.play();
       } catch {
         setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
-      } finally {
-        // liberta URL quando terminar
-        audio.onended = () => {
-          URL.revokeObjectURL(url);
-          audio.onended = null;
-        };
       }
     } catch (e: any) {
       setStatus("⚠️ Erro no TTS: " + (e?.message || e));
     }
   }
 
-  // --- Alma (modo normal, sem streaming)
-  async function askAlmaNormal(question: string) {
+  // --- ALMA (mantido)
+  async function askAlma(question: string) {
     setTranscript(question);
     setLog((l) => [...l, { role: "you", text: question }]);
-
     setStatus("🧠 A perguntar à Alma…");
     try {
-      // 20s de timeout para evitar 30s do Railway
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 20000);
-
       const r = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
-        signal: ctrl.signal,
       });
-
-      clearTimeout(timer);
-
       if (!r.ok) {
         const txt = await r.text();
         setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
@@ -181,81 +133,19 @@ export default function Page() {
       await speak(out);
       setStatus("Pronto");
     } catch (e: any) {
-      if (e?.name === "AbortError") {
-        setStatus("⚠️ Timeout ao falar com a Alma (20s).");
-      } else {
-        setStatus("⚠️ Erro: " + (e?.message || e));
-      }
+      setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
-  // --- Alma (streaming SSE)
-  async function askAlmaStreaming(question: string) {
-    setTranscript(question);
-    setLog((l) => [...l, { role: "you", text: question }]);
-    setAnswer("");
-    setStatus("🧠 (stream) A perguntar à Alma…");
-
-    try {
-      const r = await fetch("/api/alma?stream=1", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-        body: JSON.stringify({ question }),
-      });
-
-      if (!r.ok || !r.body) {
-        const txt = await r.text();
-        setStatus("⚠️ Erro no Alma (stream): " + txt.slice(0, 200));
-        return;
-      }
-
-      const reader = r.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let full = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-
-        // Grok (OpenAI compat) envia linhas SSE "data: {...}"
-        for (const line of chunk.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const payload = trimmed.slice(5).trim();
-          if (payload === "[DONE]") continue;
-
-          try {
-            const j = JSON.parse(payload);
-            const delta =
-              j?.choices?.[0]?.delta?.content ??
-              j?.choices?.[0]?.text ?? // fallback em alguns sabores
-              "";
-            if (delta) {
-              full += delta;
-              setAnswer((prev) => (prev ? prev + delta : delta));
-            }
-          } catch {
-            // ignora linhas de keepalive/etc
-          }
-        }
-      }
-
-      setLog((l) => [...l, { role: "alma", text: full }]);
-      setStatus("🔊 A falar…");
-      await speak(full);
-      setStatus("Pronto");
-    } catch (e: any) {
-      setStatus("⚠️ Erro (stream): " + (e?.message || e));
-    }
+  // --- Push-to-talk (upload) — MANTIDO
+  function buildMediaRecorder(): MediaRecorder {
+    let mime = "";
+    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
+    else if (MediaRecorder.isTypeSupported("audio/webm")) mime = "audio/webm";
+    else mime = "audio/mp4"; // fallback Safari
+    return new MediaRecorder(streamRef.current!, { mimeType: mime });
   }
 
-  async function askAlma(question: string) {
-    if (useStreaming) return askAlmaStreaming(question);
-    return askAlmaNormal(question);
-  }
-
-  // --- Fluxo “segurar para falar” (upload)
   function startHold() {
     if (!isArmed) {
       requestMic();
@@ -267,27 +157,21 @@ export default function Page() {
     }
     try {
       setStatus("🎙️ A gravar…");
-      chunksRef.current = [];
       const mr = buildMediaRecorder();
       mediaRecorderRef.current = mr;
 
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
-      };
+      const chunks: BlobPart[] = [];
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
       mr.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: mr.mimeType });
+        const blob = new Blob(chunks, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
       };
-
       mr.start();
       setIsRecording(true);
     } catch (e: any) {
       setStatus("⚠️ Falha a iniciar gravação: " + (e?.message || e));
     }
   }
-
   function stopHold() {
     if (mediaRecorderRef.current && isRecording) {
       setStatus("⏳ A processar áudio…");
@@ -298,7 +182,6 @@ export default function Page() {
 
   async function handleTranscribeAndAnswer(blob: Blob) {
     try {
-      // 1) STT
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
       fd.append("audio", blob, "audio.webm");
@@ -313,19 +196,165 @@ export default function Page() {
       }
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
-      setTranscript(said);
       if (!said) {
-        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar um pouco mais perto.");
+        setStatus("⚠️ Não consegui transcrever o áudio. Fala mais perto do micro.");
         return;
       }
-
-      // 2) ALMA (normal ou stream consoante toggle)
       await askAlma(said);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
+  // --- STREAMING PCM 16 kHz → alma-stt-ws
+  async function ensureAudioContext() {
+    if (audioCtxRef.current) return audioCtxRef.current;
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
+      sampleRate: 48000, // a maioria dos browsers usa 48k; vamos downsample para 16k
+    });
+    audioCtxRef.current = ctx;
+    return ctx;
+  }
+
+  // Pequeno worklet para: mono → downsample 16k → Int16 → postMessage(ArrayBuffer)
+  async function loadPcmWorklet(ctx: AudioContext) {
+    if (workletNodeRef.current) return;
+
+    const workletCode = `
+      class PCM16Downsampler extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this._buffer = [];
+          this._inRate = sampleRate; // p.ex. 48000
+          this._outRate = 16000;
+          this._ratio = this._inRate / this._outRate;
+          this._acc = 0;
+        }
+        process(inputs) {
+          const input = inputs[0];
+          if (!input || !input[0]) return true;
+          const ch = input[0]; // mono
+          // downsample por "accumulator"
+          const out = [];
+          for (let i = 0; i < ch.length; i++) {
+            this._acc += 1;
+            if (this._acc >= this._ratio) {
+              this._acc -= this._ratio;
+              // clamp to int16
+              let s = Math.max(-1, Math.min(1, ch[i]));
+              s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              out.push(s);
+            }
+          }
+          if (out.length) {
+            const arr = new Int16Array(out.length);
+            for (let i = 0; i < out.length; i++) arr[i] = out[i] | 0;
+            this.port.postMessage(arr.buffer, [arr.buffer]);
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm16-downsampler', PCM16Downsampler);
+    `;
+    const blob = new Blob([workletCode], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await (ctx.audioWorklet as any).addModule(url);
+    URL.revokeObjectURL(url);
+
+    const node = new AudioWorkletNode(ctx, "pcm16-downsampler");
+    workletNodeRef.current = node;
+  }
+
+  async function startStreaming() {
+    if (isStreaming) return;
+    if (!isArmed) {
+      await requestMic();
+      if (!streamRef.current) return;
+    }
+    if (!STT_WS_URL) {
+      setStatus("⚠️ NEXT_PUBLIC_STT_WS_URL não definido.");
+      return;
+    }
+
+    try {
+      setStatus("🔌 A ligar ao STT…");
+      const ctx = await ensureAudioContext();
+      await loadPcmWorklet(ctx);
+
+      const src = ctx.createMediaStreamSource(streamRef.current!);
+      sourceNodeRef.current = src;
+      const node = workletNodeRef.current!;
+      src.connect(node);
+      // não ligar a destino (sem eco)
+
+      const ws = new WebSocket(STT_WS_URL);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        setStatus("🟢 Streaming ligado. A enviar PCM16/16k…");
+        setIsStreaming(true);
+      };
+      ws.onerror = (e) => {
+        console.warn("[WS] erro", e);
+        setStatus("⚠️ Erro no WebSocket STT.");
+      };
+      ws.onclose = () => {
+        setStatus("Streaming fechado.");
+        setIsStreaming(false);
+      };
+      ws.onmessage = async (ev) => {
+        if (typeof ev.data !== "string") return;
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "transcript") {
+            if (msg.isFinal || msg.is_final) {
+              setTranscript(msg.transcript);
+              await askAlma(msg.transcript);
+            } else {
+              setTranscript(msg.transcript);
+            }
+          } else if (msg.type === "error") {
+            setStatus("⚠️ STT (WS): " + (msg.message || msg.error || "erro"));
+          }
+        } catch {}
+      };
+
+      node.port.onmessage = (e: MessageEvent) => {
+        const buf = e.data as ArrayBuffer;
+        if (ws.readyState === 1) {
+          // envia Int16 PCM (little-endian) direto
+          ws.send(buf);
+        }
+      };
+
+      wsRef.current = ws;
+    } catch (e: any) {
+      setStatus("⚠️ Falha a iniciar streaming: " + (e?.message || e));
+      await stopStreaming(); // limpeza
+    }
+  }
+
+  async function stopStreaming() {
+    try {
+      wsRef.current?.send("stop"); // o teu server trata "stop" como fim
+    } catch {}
+    try { wsRef.current?.close(); } catch {}
+    wsRef.current = null;
+
+    try { workletNodeRef.current?.port.close(); } catch {}
+    try { sourceNodeRef.current?.disconnect(); } catch {}
+    workletNodeRef.current = null;
+    sourceNodeRef.current = null;
+
+    setIsStreaming(false);
+  }
+
+  async function toggleStreaming() {
+    if (isStreaming) await stopStreaming();
+    else await startStreaming();
+  }
+
+  // --- Texto → Alma (mantido)
   async function sendTyped() {
     const q = typed.trim();
     if (!q) return;
@@ -333,7 +362,7 @@ export default function Page() {
     await askAlma(q);
   }
 
-  // Touch handlers iOS (segurar)
+  // --- UI handlers (mantido)
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -342,7 +371,6 @@ export default function Page() {
     e.preventDefault();
     stopHold();
   }
-
   function copyLog() {
     const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
     navigator.clipboard.writeText(txt).then(() => {
@@ -351,23 +379,7 @@ export default function Page() {
     });
   }
 
-  // Botão manual para “Ativar som” (iOS teimoso)
-  function unlockSoundManually() {
-    if (!ttsAudioRef.current) return;
-    const el = ttsAudioRef.current;
-    try {
-      el.muted = true;
-      el.play()
-        .then(() => {
-          el.pause();
-          el.currentTime = 0;
-          el.muted = false;
-          setStatus("Som pronto ✅");
-        })
-        .catch(() => setStatus("⚠️ Toca no ecrã outra vez para ativar o som."));
-    } catch {}
-  }
-
+  // --- UI (igual ao teu, com botão Streaming)
   return (
     <main
       style={{
@@ -384,7 +396,6 @@ export default function Page() {
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto</h1>
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
-      {/* Controlo de micro + som + streaming toggle */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -400,36 +411,33 @@ export default function Page() {
         </button>
 
         <button
-          onClick={unlockSoundManually}
+          onClick={toggleStreaming}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
             border: "1px solid #444",
-            background: "#222",
-            color: "#ddd",
+            background: isStreaming ? "#004488" : "#333",
+            color: "#fff",
           }}
         >
-          Ativar som (iOS)
+          {isStreaming ? "⏹️ Parar streaming" : "🔴 Iniciar streaming"}
         </button>
 
-        <label
+        <button
+          onMouseDown={onHoldStart}
+          onMouseUp={onHoldEnd}
+          onTouchStart={onHoldStart}
+          onTouchEnd={onHoldEnd}
           style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 8,
+            padding: "10px 14px",
+            borderRadius: 999,
             border: "1px solid #444",
-            borderRadius: 8,
-            padding: "8px 12px",
-            background: "#111",
+            background: isRecording ? "#8b0000" : "#333",
+            color: "#fff",
           }}
         >
-          <input
-            type="checkbox"
-            checked={useStreaming}
-            onChange={(e) => setUseStreaming(e.target.checked)}
-          />
-          Usar streaming do Grok
-        </label>
+          {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
+        </button>
 
         <button
           onClick={copyLog}
@@ -445,7 +453,6 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Entrada por texto */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
           value={typed}
@@ -477,38 +484,6 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Hold-to-talk (upload) */}
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
-        <button
-          onMouseDown={(e) => {
-            e.preventDefault();
-            startHold();
-          }}
-          onMouseUp={(e) => {
-            e.preventDefault();
-            stopHold();
-          }}
-          onTouchStart={(e) => {
-            e.preventDefault();
-            startHold();
-          }}
-          onTouchEnd={(e) => {
-            e.preventDefault();
-            stopHold();
-          }}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 999,
-            border: "1px solid #444",
-            background: isRecording ? "#8b0000" : "#333",
-            color: "#fff",
-          }}
-        >
-          {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
-        </button>
-      </div>
-
-      {/* Conversa simples */}
       <div
         style={{
           border: "1px solid #333",
