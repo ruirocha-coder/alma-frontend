@@ -10,7 +10,7 @@ const STT_WS_URL =
   ""; // ex.: wss://alma-stt-ws-xxxx.up.railway.app/stt
 
 export default function Page() {
-  // --- UI state (mantido)
+  // --- UI state
   const [status, setStatus] = useState("Pronto");
   const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false); // push-to-talk
@@ -21,10 +21,9 @@ export default function Page() {
   const [typed, setTyped] = useState("");
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // --- Media / refs (mantido + novos)
+  // --- Media / refs
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null); // upload (push-to-talk)
-  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Streaming (PCM 16 kHz)
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -32,7 +31,10 @@ export default function Page() {
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // cria <audio> TTS + unlock iOS (mantido)
+  // player TTS
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // cria <audio> TTS + “unlock” iOS
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true;
@@ -43,24 +45,29 @@ export default function Page() {
     const unlock = () => {
       if (!ttsAudioRef.current) return;
       const el = ttsAudioRef.current;
-      el.muted = true;
-      el.play().then(() => {
-        el.pause();
-        el.currentTime = 0;
-        el.muted = false;
-      }).catch(() => {});
+      try {
+        el.muted = true;
+        el.play()
+          .then(() => {
+            el.pause();
+            el.currentTime = 0;
+            el.muted = false;
+          })
+          .catch(() => {});
+      } catch {}
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
     };
     document.addEventListener("click", unlock, { once: true });
     document.addEventListener("touchstart", unlock, { once: true });
+
     return () => {
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
     };
   }, []);
 
-  // --- Permissão do micro (mantido)
+  // --- Permissão do micro
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
@@ -76,7 +83,7 @@ export default function Page() {
     }
   }
 
-  // --- TTS (mantido)
+  // --- TTS
   async function speak(text: string) {
     if (!text) return;
     try {
@@ -109,7 +116,7 @@ export default function Page() {
     }
   }
 
-  // --- ALMA (mantido)
+  // --- ALMA
   async function askAlma(question: string) {
     setTranscript(question);
     setLog((l) => [...l, { role: "you", text: question }]);
@@ -137,7 +144,7 @@ export default function Page() {
     }
   }
 
-  // --- Push-to-talk (upload) — MANTIDO
+  // --- Push-to-talk (upload)
   function buildMediaRecorder(): MediaRecorder {
     let mime = "";
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
@@ -210,22 +217,21 @@ export default function Page() {
   async function ensureAudioContext() {
     if (audioCtxRef.current) return audioCtxRef.current;
     const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
-      sampleRate: 48000, // a maioria dos browsers usa 48k; vamos downsample para 16k
+      sampleRate: 48000, // a maioria usa 48k; vamos fazer downsample para 16k
     });
     audioCtxRef.current = ctx;
     return ctx;
   }
 
-  // Pequeno worklet para: mono → downsample 16k → Int16 → postMessage(ArrayBuffer)
+  // Worklet mono → downsample 16k → Int16 → postMessage(ArrayBuffer) (com guard)
   async function loadPcmWorklet(ctx: AudioContext) {
-    if (workletNodeRef.current) return;
+    if (workletNodeRef.current) return; // já criado
 
     const workletCode = `
       class PCM16Downsampler extends AudioWorkletProcessor {
         constructor() {
           super();
-          this._buffer = [];
-          this._inRate = sampleRate; // p.ex. 48000
+          this._inRate = sampleRate;     // p.ex. 48000
           this._outRate = 16000;
           this._ratio = this._inRate / this._outRate;
           this._acc = 0;
@@ -234,13 +240,11 @@ export default function Page() {
           const input = inputs[0];
           if (!input || !input[0]) return true;
           const ch = input[0]; // mono
-          // downsample por "accumulator"
           const out = [];
           for (let i = 0; i < ch.length; i++) {
             this._acc += 1;
             if (this._acc >= this._ratio) {
               this._acc -= this._ratio;
-              // clamp to int16
               let s = Math.max(-1, Math.min(1, ch[i]));
               s = s < 0 ? s * 0x8000 : s * 0x7FFF;
               out.push(s);
@@ -258,7 +262,15 @@ export default function Page() {
     `;
     const blob = new Blob([workletCode], { type: "application/javascript" });
     const url = URL.createObjectURL(blob);
-    await (ctx.audioWorklet as any).addModule(url);
+    try {
+      await (ctx.audioWorklet as any).addModule(url);
+    } catch (e: any) {
+      // Se já estiver registado, ignoramos o erro e seguimos
+      if (!String(e?.message || e).includes("already registered")) {
+        URL.revokeObjectURL(url);
+        throw e;
+      }
+    }
     URL.revokeObjectURL(url);
 
     const node = new AudioWorkletNode(ctx, "pcm16-downsampler");
@@ -284,8 +296,7 @@ export default function Page() {
       const src = ctx.createMediaStreamSource(streamRef.current!);
       sourceNodeRef.current = src;
       const node = workletNodeRef.current!;
-      src.connect(node);
-      // não ligar a destino (sem eco)
+      src.connect(node); // não ligar a destino (evitar eco)
 
       const ws = new WebSocket(STT_WS_URL);
       ws.binaryType = "arraybuffer";
@@ -320,23 +331,20 @@ export default function Page() {
       };
 
       node.port.onmessage = (e: MessageEvent) => {
-        const buf = e.data as ArrayBuffer;
-        if (ws.readyState === 1) {
-          // envia Int16 PCM (little-endian) direto
-          ws.send(buf);
-        }
+        const buf = e.data as ArrayBuffer; // Int16 PCM
+        if (ws.readyState === 1) ws.send(buf);
       };
 
       wsRef.current = ws;
     } catch (e: any) {
       setStatus("⚠️ Falha a iniciar streaming: " + (e?.message || e));
-      await stopStreaming(); // limpeza
+      await stopStreaming();
     }
   }
 
   async function stopStreaming() {
     try {
-      wsRef.current?.send("stop"); // o teu server trata "stop" como fim
+      wsRef.current?.send("stop");
     } catch {}
     try { wsRef.current?.close(); } catch {}
     wsRef.current = null;
@@ -354,7 +362,7 @@ export default function Page() {
     else await startStreaming();
   }
 
-  // --- Texto → Alma (mantido)
+  // --- Texto → Alma
   async function sendTyped() {
     const q = typed.trim();
     if (!q) return;
@@ -362,7 +370,7 @@ export default function Page() {
     await askAlma(q);
   }
 
-  // --- UI handlers (mantido)
+  // --- UI handlers
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -379,7 +387,6 @@ export default function Page() {
     });
   }
 
-  // --- UI (igual ao teu, com botão Streaming)
   return (
     <main
       style={{
@@ -396,6 +403,7 @@ export default function Page() {
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto</h1>
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
+      {/* Controlo de micro + streaming */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -439,6 +447,20 @@ export default function Page() {
           {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
         </button>
 
+        {/* NOVO: botão de teste de voz (desbloqueia áudio no iOS) */}
+        <button
+          onClick={() => speak("Olá! Estou a testar a voz da Alma.")}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #444",
+            background: "#225522",
+            color: "#fff",
+          }}
+        >
+          Testar voz
+        </button>
+
         <button
           onClick={copyLog}
           style={{
@@ -453,6 +475,7 @@ export default function Page() {
         </button>
       </div>
 
+      {/* Entrada por texto */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
           value={typed}
@@ -484,6 +507,7 @@ export default function Page() {
         </button>
       </div>
 
+      {/* Conversa / histórico */}
       <div
         style={{
           border: "1px solid #333",
