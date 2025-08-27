@@ -3,51 +3,82 @@ import { NextRequest } from "next/server";
 
 export async function POST(req: NextRequest) {
   try {
-    const { text } = await req.json();
-    if (!text || !text.trim()) {
+    const { text, voiceId, model } = (await req.json()) as {
+      text?: string;
+      voiceId?: string;
+      model?: string;
+    };
+
+    const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
+    const ELEVEN_VOICE_ID =
+      voiceId || process.env.ELEVENLABS_VOICE_ID || ""; // define nas Variáveis do Railway
+    const ELEVEN_MODEL =
+      model ||
+      process.env.ELEVENLABS_MODEL || // opcional; se não existir, usamos um seguro
+      "eleven_turbo_v2_5"; // bom para PT; alternativa: "eleven_multilingual_v2"
+
+    if (!ELEVEN_API_KEY) {
+      return new Response("Missing ELEVENLABS_API_KEY", { status: 500 });
+    }
+    if (!ELEVEN_VOICE_ID) {
+      return new Response("Missing ELEVENLABS_VOICE_ID", { status: 500 });
+    }
+    const prompt = (text || "").trim();
+    if (!prompt) {
       return new Response("Missing text", { status: 400 });
     }
 
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || "Rachel"; // mete o teu VOICE_ID
-    const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
+    // Proteção simples contra textos gigantes
+    const truncated =
+      prompt.length > 1200 ? prompt.slice(0, 1200) + "…" : prompt;
 
-    if (!apiKey) {
-      return new Response("ELEVENLABS_API_KEY not set", { status: 500 });
-    }
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
+      ELEVEN_VOICE_ID
+    )}`;
 
-    const r = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": apiKey,
-          "Content-Type": "application/json",
-          Accept: "audio/mpeg",
-        },
-        body: JSON.stringify({
-          model_id: modelId,
-          text,
-          // PT-PT melhora “s”/“z” e prosódia
-          voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0, use_speaker_boost: true },
-        }),
-      }
-    );
+    const body = {
+      text: truncated,
+      model_id: ELEVEN_MODEL,
+      voice_settings: {
+        stability: 0.4,
+        similarity_boost: 0.8,
+        style: 0.2,
+        use_speaker_boost: true,
+      },
+      // Se usares o plano novo, podes omitir "optimize_streaming_latency"
+    };
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify(body),
+    });
 
     if (!r.ok) {
-      const errTxt = await r.text();
-      return new Response(`TTS error: ${r.status} ${errTxt}`, { status: 502 });
+      const errTxt = await r.text().catch(() => "");
+      return new Response(
+        `TTS error: ${r.status} ${errTxt || r.statusText}`,
+        { status: 502 }
+      );
     }
 
-    // Stream MP3 de volta
-    return new Response(r.body, {
+    const ab = await r.arrayBuffer();
+
+    return new Response(ab, {
       status: 200,
       headers: {
         "Content-Type": "audio/mpeg",
         "Cache-Control": "no-store",
       },
     });
-  } catch (e: any) {
-    return new Response(`TTS exception: ${e?.message || e}`, { status: 500 });
+  } catch (err: any) {
+    return new Response(
+      `TTS error: ${(err?.message as string) || String(err)}`,
+      { status: 502 }
+    );
   }
 }
