@@ -17,42 +17,43 @@ export default function Page() {
   // --- Media / refs
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+
+  // TTS player
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsObjectUrlRef = useRef<string | null>(null);
+  const audioUnlockedRef = useRef<boolean>(false);
 
-  // ---- iOS unlock helpers
+  // ======== Helpers iOS / áudio (unlock só para iOS) ========
   const SILENCE_WAV =
     "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQgAAAAA";
 
   function isIOS() {
-    return (
-      typeof navigator !== "undefined" &&
-      (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
-        (navigator.platform === "MacIntel" &&
-          (navigator as any).maxTouchPoints > 1))
-    );
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    const iOSDevice =
+      /iPad|iPhone|iPod/.test(ua) ||
+      (navigator.platform === "MacIntel" && (navigator as any).maxTouchPoints > 1);
+    return iOSDevice;
   }
 
-  async function ensureUnlockedAudio(ttsAudio: HTMLAudioElement) {
+  async function unlockAudioOnceIOS() {
+    if (!isIOS()) return; // só iOS precisa
+    if (audioUnlockedRef.current) return;
+    const a = ttsAudioRef.current;
+    if (!a) return;
     try {
-      const r = await ttsAudio.play();
-      if (r !== undefined) {
-        ttsAudio.pause();
-        ttsAudio.currentTime = 0;
-      }
-    } catch {}
-    if (isIOS()) {
-      try {
-        ttsAudio.src = SILENCE_WAV;
-        (ttsAudio as any).playsInline = true;
-        ttsAudio.setAttribute("playsinline", "true");
-        ttsAudio.setAttribute("webkit-playsinline", "true");
-        ttsAudio.muted = true;
-        await ttsAudio.play().catch(() => {});
-        ttsAudio.pause();
-        ttsAudio.currentTime = 0;
-        ttsAudio.muted = false;
-      } catch {}
+      a.src = SILENCE_WAV;
+      (a as any).playsInline = true;
+      a.setAttribute("playsinline", "true");
+      a.setAttribute("webkit-playsinline", "true");
+      a.muted = true;
+      await a.play().catch(() => {});
+      a.pause();
+      a.currentTime = 0;
+      a.muted = false;
+      audioUnlockedRef.current = true;
+    } catch {
+      // Ignora — o próximo gesto do utilizador volta a tentar
     }
   }
 
@@ -63,14 +64,24 @@ export default function Page() {
     a.autoplay = false;
     a.preload = "auto";
     ttsAudioRef.current = a;
+
+    // no iOS, desbloquear no primeiro gesto
+    const onGesture = () => unlockAudioOnceIOS();
+    if (isIOS()) {
+      document.addEventListener("click", onGesture, { once: true });
+      document.addEventListener("touchstart", onGesture, { once: true });
+    }
+
     return () => {
-      if (ttsObjectUrlRef.current) {
-        URL.revokeObjectURL(ttsObjectUrlRef.current);
+      if (isIOS()) {
+        document.removeEventListener("click", onGesture);
+        document.removeEventListener("touchstart", onGesture);
       }
+      if (ttsObjectUrlRef.current) URL.revokeObjectURL(ttsObjectUrlRef.current);
     };
   }, []);
 
-  // --- Permissão do micro
+  // ======== Micro ========
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
@@ -86,7 +97,19 @@ export default function Page() {
     }
   }
 
-  // --- TTS
+  function buildMediaRecorder(): MediaRecorder {
+    // Preferir webm/opus quando existir (Chrome/Firefox)
+    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+      return new MediaRecorder(streamRef.current!, { mimeType: "audio/webm;codecs=opus" });
+    }
+    if (MediaRecorder.isTypeSupported("audio/webm")) {
+      return new MediaRecorder(streamRef.current!, { mimeType: "audio/webm" });
+    }
+    // Safari iOS cai aqui: audio/mp4 (AAC) — o teu /api/stt já tratou disto antes
+    return new MediaRecorder(streamRef.current!, { mimeType: "audio/mp4" });
+  }
+
+  // ======== TTS (versão simples que funcionava no Windows/Chrome) ========
   async function speak(text: string) {
     if (!text) return;
     const audio = ttsAudioRef.current;
@@ -95,12 +118,13 @@ export default function Page() {
       return;
     }
     try {
-      await ensureUnlockedAudio(audio);
+      // iOS: garantir unlock (não afeta Windows/Chrome)
+      await unlockAudioOnceIOS();
+
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
-        signal: AbortSignal.timeout ? AbortSignal.timeout(45000) : undefined,
       });
       if (!r.ok) {
         const txt = await r.text();
@@ -110,11 +134,7 @@ export default function Page() {
       const ab = await r.arrayBuffer();
       const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
-
-      if (ttsObjectUrlRef.current) {
-        URL.revokeObjectURL(ttsObjectUrlRef.current);
-        ttsObjectUrlRef.current = null;
-      }
+      if (ttsObjectUrlRef.current) URL.revokeObjectURL(ttsObjectUrlRef.current);
       ttsObjectUrlRef.current = url;
 
       audio.src = url;
@@ -122,22 +142,16 @@ export default function Page() {
       audio.setAttribute("playsinline", "true");
       audio.setAttribute("webkit-playsinline", "true");
 
-      try {
-        await audio.play();
-      } catch {
-        setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
-      }
-    } catch (e: any) {
-      setStatus("⚠️ Erro no TTS: " + (e?.message || e));
+      await audio.play();
+    } catch {
+      setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
     }
   }
 
   async function testVoice() {
-    const audio = ttsAudioRef.current;
-    if (!audio) return;
     setStatus("🔊 A preparar áudio…");
     try {
-      await ensureUnlockedAudio(audio);
+      await unlockAudioOnceIOS();
       await speak("Olá! Sou a Alma. Já posso falar no teu dispositivo.");
       setStatus("Pronto");
     } catch {
@@ -145,7 +159,7 @@ export default function Page() {
     }
   }
 
-  // --- ALMA
+  // ======== Alma (mesmo fluxo que tinhas)
   async function askAlma(question: string) {
     setTranscript(question);
     setLog((l) => [...l, { role: "you", text: question }]);
@@ -155,7 +169,6 @@ export default function Page() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
-        signal: AbortSignal.timeout ? AbortSignal.timeout(45000) : undefined,
       });
       if (!r.ok) {
         const txt = await r.text();
@@ -174,24 +187,14 @@ export default function Page() {
     }
   }
 
-  // --- Push-to-talk
-  function buildMediaRecorder(): MediaRecorder {
-    let mime = "";
-    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus"))
-      mime = "audio/webm;codecs=opus";
-    else if (MediaRecorder.isTypeSupported("audio/webm"))
-      mime = "audio/webm";
-    else mime = "audio/mp4";
-    return new MediaRecorder(streamRef.current!, { mimeType: mime });
-  }
-
+  // ======== Push-to-talk (upload) — igual ao teu
   function startHold() {
     if (!isArmed) {
       requestMic();
       return;
     }
     if (!streamRef.current) {
-      setStatus("⚠️ Micro não está pronto.");
+      setStatus("⚠️ Micro não está pronto. Carrega primeiro em 'Ativar micro'.");
       return;
     }
     try {
@@ -200,9 +203,7 @@ export default function Page() {
       mediaRecorderRef.current = mr;
 
       const chunks: BlobPart[] = [];
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data);
-      };
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
       mr.onstop = async () => {
         const blob = new Blob(chunks, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
@@ -225,7 +226,7 @@ export default function Page() {
     try {
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
-      fd.append("audio", blob, "audio.webm");
+      fd.append("audio", blob, "audio.webm"); // o backend já aceitava isto no teu fluxo
       fd.append("language", "pt-PT");
 
       const sttResp = await fetch("/api/stt", { method: "POST", body: fd });
@@ -238,7 +239,7 @@ export default function Page() {
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
       if (!said) {
-        setStatus("⚠️ Não consegui transcrever o áudio.");
+        setStatus("⚠️ Não consegui transcrever o áudio. Fala mais perto do micro.");
         return;
       }
       await askAlma(said);
@@ -247,7 +248,7 @@ export default function Page() {
     }
   }
 
-  // --- Texto → Alma
+  // ======== Texto → Alma
   async function sendTyped() {
     const q = typed.trim();
     if (!q) return;
@@ -255,6 +256,7 @@ export default function Page() {
     await askAlma(q);
   }
 
+  // ======== UI handlers
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -263,6 +265,7 @@ export default function Page() {
     e.preventDefault();
     stopHold();
   }
+
   function copyLog() {
     const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
     navigator.clipboard.writeText(txt).then(() => {
@@ -271,6 +274,7 @@ export default function Page() {
     });
   }
 
+  // ======== UI
   return (
     <main
       style={{
@@ -278,17 +282,16 @@ export default function Page() {
         margin: "0 auto",
         padding: 16,
         fontFamily:
-          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial',
+          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
         color: "#fff",
         background: "#0b0b0b",
         minHeight: "100vh",
       }}
     >
-      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
-        🎭 Alma — Voz & Texto
-      </h1>
+      <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto</h1>
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
+      {/* Controlo de micro + teste de voz */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -313,7 +316,7 @@ export default function Page() {
             color: "#fff",
           }}
         >
-          Testar voz 🔊
+          🔊 Testar voz
         </button>
 
         <button
@@ -346,6 +349,7 @@ export default function Page() {
         </button>
       </div>
 
+      {/* Entrada por texto */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
           value={typed}
@@ -377,6 +381,7 @@ export default function Page() {
         </button>
       </div>
 
+      {/* Conversa simples */}
       <div
         style={{
           border: "1px solid #333",
@@ -402,9 +407,7 @@ export default function Page() {
             {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
             {log.map((m, i) => (
               <div key={i} style={{ whiteSpace: "pre-wrap" }}>
-                <span style={{ color: "#999" }}>
-                  {m.role === "you" ? "Tu:" : "Alma:"}
-                </span>{" "}
+                <span style={{ color: "#999" }}>{m.role === "you" ? "Tu:" : "Alma:"}</span>{" "}
                 {m.text}
               </div>
             ))}
