@@ -9,15 +9,10 @@ export default function Page() {
   const [status, setStatus] = useState("Pronto");
   const [isArmed, setIsArmed] = useState(false); // micro ativado
   const [isRecording, setIsRecording] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
-
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
-
-  // entrada por texto
   const [typed, setTyped] = useState("");
 
-  // histórico
   const [log, setLog] = useState<LogItem[]>([]);
 
   // --- Audio / Recorder refs
@@ -25,40 +20,60 @@ export default function Page() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
 
-  // Audio element para TTS
+  // TTS audio element
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsObjectUrlRef = useRef<string | null>(null);
 
-  // cria o <audio> de TTS uma vez + desbloqueio iOS
+  // cria o <audio> de TTS uma vez e configura desbloqueio iOS
   useEffect(() => {
-    const a = new Audio();
-    // TS não conhece playsInline para <audio>; cast para evitar erro de build
-    (a as any).playsInline = true;
-    a.autoplay = false;
-    a.preload = "auto";
-    ttsAudioRef.current = a;
+    const audio = document.createElement("audio");
+    (audio as any).playsInline = true; // iOS
+    audio.autoplay = false;
+    audio.preload = "auto";
+    audio.crossOrigin = "anonymous";
+    ttsAudioRef.current = audio;
 
-    // Desbloquear áudio em iOS no primeiro gesto do utilizador
-    const unlockAudio = () => {
+    // quando terminar, libertar URL
+    audio.onended = () => {
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
+    };
+
+    // Desbloquear contexto de áudio no primeiro gesto (iOS)
+    const unlock = () => {
+      if (!ttsAudioRef.current) return;
       const el = ttsAudioRef.current;
-      if (!el) return;
       try {
         el.muted = true;
-        el.play().then(() => {
-          el.pause();
-          el.currentTime = 0;
-          el.muted = false;
-        }).catch(() => {});
+        el
+          .play()
+          .then(() => {
+            el.pause();
+            el.currentTime = 0;
+            el.muted = false;
+          })
+          .catch(() => {
+            // ignorar — alguns browsers não precisam disto
+          });
       } catch {}
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
-    document.addEventListener("click", unlockAudio, { once: true });
-    document.addEventListener("touchstart", unlockAudio, { once: true });
+    document.addEventListener("click", unlock, { once: true });
+    document.addEventListener("touchstart", unlock, { once: true });
 
-    // Clean up
     return () => {
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
+      try {
+        audio.pause();
+      } catch {}
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
     };
   }, []);
 
@@ -71,7 +86,7 @@ export default function Page() {
         audio: {
           channelCount: 1,
           noiseSuppression: true,
-          echoCancellation: false, // podes ligar se houver feedback
+          echoCancellation: false,
         },
         video: false,
       });
@@ -89,14 +104,101 @@ export default function Page() {
     let mime = "";
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
     else if (MediaRecorder.isTypeSupported("audio/webm")) mime = "audio/webm";
-    else mime = "audio/mp4"; // fallback (Safari antigo)
+    else mime = "audio/mp4"; // fallback Safari
     const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
     return mr;
   }
 
+  // --- TTS robusto (usado pelo botão de teste e pelas respostas da Alma)
+  async function speak(text: string) {
+    if (!text) return;
+    const audio = ttsAudioRef.current;
+    if (!audio) {
+      setStatus("⚠️ Áudio não inicializado.");
+      return;
+    }
+    try {
+      const r = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // se o backend /api/tts aceitar voiceId/model, podes adicionar aqui
+        body: JSON.stringify({ text }),
+        // aumentar tolerância a respostas mais lentas no TTS
+        signal: AbortSignal.timeout ? AbortSignal.timeout(45000) : undefined,
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
+        return;
+      }
+      const ab = await r.arrayBuffer();
+      const blob = new Blob([ab], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+
+      // limpar URL anterior, se existir
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
+      ttsObjectUrlRef.current = url;
+
+      audio.src = url;
+
+      // Em iOS, o play precisa de gesto do utilizador recente.
+      // Normalmente o clique em "Enviar" ou soltar do hold conta como gesto.
+      try {
+        await audio.play();
+      } catch {
+        setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
+      }
+    } catch (e: any) {
+      setStatus("⚠️ Erro no TTS: " + (e?.message || e));
+    }
+  }
+
+  function stopSpeaking() {
+    const audio = ttsAudioRef.current;
+    if (!audio) return;
+    try {
+      audio.pause();
+      audio.currentTime = 0;
+    } catch {}
+  }
+
+  // --- Alma (mantido)
+  async function askAlma(question: string) {
+    setTranscript(question);
+    setLog((l) => [...l, { role: "you", text: question }]);
+
+    setStatus("🧠 A perguntar à Alma…");
+    try {
+      const r = await fetch("/api/alma", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+        // tolerância para pedidos que demorem
+        signal: AbortSignal.timeout ? AbortSignal.timeout(45000) : undefined,
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
+        return;
+      }
+      const j = (await r.json()) as { answer?: string };
+      const out = (j.answer || "").trim();
+      setAnswer(out);
+      setLog((l) => [...l, { role: "alma", text: out }]);
+      setStatus("🔊 A falar…");
+      await speak(out);
+      setStatus("Pronto");
+    } catch (e: any) {
+      setStatus("⚠️ Erro: " + (e?.message || e));
+    }
+  }
+
+  // --- Fluxo “segurar para falar” (upload)
   function startHold() {
     if (!isArmed) {
-      // primeira interação: ativar micro
       requestMic();
       return;
     }
@@ -136,54 +238,11 @@ export default function Page() {
     }
   }
 
-  // --- ALMA (timeout aumentado)
-  async function askAlma(question: string) {
-    setTranscript(question);
-    setLog((l) => [...l, { role: "you", text: question }]);
-
-    setStatus("🧠 A perguntar à Alma…");
-
-    // Timeout 100s para evitar abort prematuro
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 100000);
-
-    try {
-      const r = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
-        signal: ctrl.signal,
-      });
-
-      clearTimeout(timer);
-
-      if (!r.ok) {
-        const txt = await r.text();
-        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
-        return;
-      }
-
-      const j = (await r.json()) as { answer?: string };
-      const out = (j.answer || "").trim();
-      setAnswer(out);
-      setLog((l) => [...l, { role: "alma", text: out }]);
-      setStatus("🔊 A falar…");
-
-      await speak(out);
-      setStatus("Pronto");
-    } catch (e: any) {
-      clearTimeout(timer);
-      setStatus("⚠️ Erro: " + (e?.message || e));
-    }
-  }
-
-  // --- STT upload
   async function handleTranscribeAndAnswer(blob: Blob) {
     try {
       // 1) STT
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
-      // Mantemos webm/mp4 — o teu /api/stt já está a aceitar e a funcionar
       fd.append("audio", blob, "audio.webm");
       fd.append("language", "pt-PT");
 
@@ -197,81 +256,14 @@ export default function Page() {
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
       if (!said) {
-        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar um pouco mais perto.");
+        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar mais perto do micro.");
         return;
       }
 
-      // 2) ALMA
+      // 2) ALMA + 3) TTS
       await askAlma(said);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
-    }
-  }
-
-  // --- TTS (timeout aumentado) + parar fala
-  function stopSpeaking() {
-    const audio = ttsAudioRef.current;
-    if (!audio) return;
-    try {
-      audio.pause();
-      audio.currentTime = 0;
-    } catch {}
-    setSpeaking(false);
-  }
-
-  async function speak(text: string) {
-    if (!text) return;
-
-    // Se já está a falar algo, interrompe primeiro
-    stopSpeaking();
-
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 100000);
-
-    try {
-      const r = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-        signal: ctrl.signal,
-      });
-
-      clearTimeout(timer);
-
-      if (!r.ok) {
-        const txt = await r.text();
-        setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
-        return;
-      }
-
-      const ab = await r.arrayBuffer();
-      const blob = new Blob([ab], { type: "audio/mpeg" });
-      const url = URL.createObjectURL(blob);
-
-      const audio = ttsAudioRef.current;
-      if (!audio) {
-        setStatus("⚠️ Áudio não inicializado.");
-        return;
-      }
-
-      audio.src = url;
-
-      // Quando terminar, limpa estado
-      audio.onended = () => {
-        setSpeaking(false);
-      };
-
-      try {
-        setSpeaking(true);
-        await audio.play();
-      } catch {
-        setSpeaking(false);
-        setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
-      }
-    } catch (e: any) {
-      clearTimeout(timer);
-      setSpeaking(false);
-      setStatus("⚠️ Erro no TTS: " + (e?.message || e));
     }
   }
 
@@ -317,7 +309,7 @@ export default function Page() {
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto</h1>
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
-      {/* Controlo de micro + TTS utilitários */}
+      {/* Controlo de micro + TTS */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -330,22 +322,6 @@ export default function Page() {
           }}
         >
           {isArmed ? "Micro pronto ✅" : "Ativar micro"}
-        </button>
-
-        <button
-          onMouseDown={onHoldStart}
-          onMouseUp={onHoldEnd}
-          onTouchStart={onHoldStart}
-          onTouchEnd={onHoldEnd}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 999,
-            border: "1px solid #444",
-            background: isRecording ? "#8b0000" : "#333",
-            color: "#fff",
-          }}
-        >
-          {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
         </button>
 
         <button
@@ -363,17 +339,31 @@ export default function Page() {
 
         <button
           onClick={stopSpeaking}
-          disabled={!speaking}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
             border: "1px solid #444",
-            background: speaking ? "#552222" : "#2a2a2a",
+            background: "#552222",
             color: "#fff",
-            opacity: speaking ? 1 : 0.6,
           }}
         >
           Interromper fala ⏹️
+        </button>
+
+        <button
+          onMouseDown={onHoldStart}
+          onMouseUp={onHoldEnd}
+          onTouchStart={onHoldStart}
+          onTouchEnd={onHoldEnd}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 999,
+            border: "1px solid #444",
+            background: isRecording ? "#8b0000" : "#333",
+            color: "#fff",
+          }}
+        >
+          {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
         </button>
 
         <button
