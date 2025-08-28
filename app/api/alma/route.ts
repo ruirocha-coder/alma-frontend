@@ -3,7 +3,10 @@ import { NextRequest, NextResponse } from "next/server";
 
 export async function POST(req: NextRequest) {
   try {
-    const { question } = await req.json();
+    const body = await req.json();
+    const question: string = (body?.question || "").trim();
+    const context: string = (body?.context || "").trim();
+
     const ALMA_URL =
       process.env.NEXT_PUBLIC_ALMA_SERVER_URL || process.env.ALMA_SERVER_URL;
 
@@ -14,10 +17,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Injeta contexto de forma segura (sem quebrar o server atual)
+    const qWithCtx = context
+      ? `Contexto (últimas mensagens):\n${context}\n\nPergunta: ${question}`
+      : question;
+
     const r = await fetch(ALMA_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      // o teu alma-server espera {question}
+      body: JSON.stringify({ question: qWithCtx }),
+      // não deixamos pendurado: 15s máx
+      signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
     });
 
     if (!r.ok) {
