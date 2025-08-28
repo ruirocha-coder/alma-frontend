@@ -4,78 +4,26 @@ import React, { useEffect, useRef, useState } from "react";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
-// URL do WS (streaming) – mantém como tinhas
-const STT_WS_URL =
-  (typeof window !== "undefined" && (window as any).env?.NEXT_PUBLIC_STT_WS_URL) ||
-  process.env.NEXT_PUBLIC_STT_WS_URL ||
-  "";
-
-/** ====== Helpers: timeout + retries padrão ====== */
-async function fetchWithTimeout(
-  input: RequestInfo | URL,
-  init: RequestInit & { timeoutMs?: number } = {}
-) {
-  const { timeoutMs = 30000, ...rest } = init;
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(input, { ...rest, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-async function retry<T>(
-  fn: () => Promise<T>,
-  attempts = 2,
-  baseDelayMs = 300
-): Promise<T> {
-  let lastErr: any;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (e: any) {
-      lastErr = e;
-      // AbortError: não vale a pena backoff grande; tenta 1x rápido
-      const isAbort =
-        e?.name === "AbortError" ||
-        /aborted/i.test(String(e?.message || e));
-      const wait = isAbort ? 200 : baseDelayMs * Math.pow(2, i);
-      await new Promise((r) => setTimeout(r, wait));
-    }
-  }
-  throw lastErr;
-}
-
 export default function Page() {
   // --- UI state
-  const [status, setStatus] = useState<string>("Pronto");
+  const [status, setStatus] = useState("Pronto");
   const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [isStreaming, setIsStreaming] = useState(false);
 
-  const [transcript, setTranscript] = useState<string>("");
-  const [answer, setAnswer] = useState<string>("");
+  const [transcript, setTranscript] = useState("");
+  const [answer, setAnswer] = useState("");
   const [typed, setTyped] = useState("");
-
   const [log, setLog] = useState<LogItem[]>([]);
 
   // --- Audio / Recorder refs
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
 
-  // TTS player
+  // Reutilizamos um único <audio> para TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUnlockedRef = useRef(false);
 
-  // Streaming WS refs (mantidos caso uses o botão “Streaming”)
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const requestTimerRef = useRef<any>(null);
-
-  // cria o <audio> de TTS uma vez (com desbloqueio iOS)
+  // cria o <audio> de TTS uma vez + rotina de desbloqueio iOS
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true; // iOS
@@ -83,9 +31,12 @@ export default function Page() {
     a.preload = "auto";
     ttsAudioRef.current = a;
 
-    const unlockAudio = () => {
+    const unlock = () => {
+      if (audioUnlockedRef.current) return;
       const el = ttsAudioRef.current;
       if (!el) return;
+
+      // pequeno “beep” silencioso só para desbloquear autoplay
       el.muted = true;
       el
         .play()
@@ -93,17 +44,25 @@ export default function Page() {
           el.pause();
           el.currentTime = 0;
           el.muted = false;
+          audioUnlockedRef.current = true;
         })
-        .catch(() => {});
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+        .catch(() => {
+          // ignore – alguns browsers só desbloqueiam no 2º toque
+        });
     };
-    document.addEventListener("click", unlockAudio, { once: true });
-    document.addEventListener("touchstart", unlockAudio, { once: true });
+
+    // desbloqueamos no primeiro gesto do utilizador
+    const onFirstGesture = () => {
+      unlock();
+      document.removeEventListener("click", onFirstGesture);
+      document.removeEventListener("touchstart", onFirstGesture);
+    };
+    document.addEventListener("click", onFirstGesture, { once: true });
+    document.addEventListener("touchstart", onFirstGesture, { once: true });
 
     return () => {
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", onFirstGesture);
+      document.removeEventListener("touchstart", onFirstGesture);
     };
   }, []);
 
@@ -113,20 +72,14 @@ export default function Page() {
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          noiseSuppression: true,
-          echoCancellation: false,
-        },
+        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
         video: false,
       });
       streamRef.current = stream;
       setIsArmed(true);
-      setStatus("Micro pronto. Mantém o botão para falar ou inicia streaming.");
-    } catch (e: any) {
-      setStatus(
-        "⚠️ Permissão do micro negada. Abre as definições do navegador e permite acesso ao micro."
-      );
+      setStatus("Micro pronto. Mantém o botão para falar.");
+    } catch {
+      setStatus("⚠️ Permissão do micro negada no navegador/dispositivo.");
     }
   }
 
@@ -135,28 +88,20 @@ export default function Page() {
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
     else if (MediaRecorder.isTypeSupported("audio/webm")) mime = "audio/webm";
     else mime = "audio/mp4"; // fallback Safari
-    const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
-    (mr as any).__mime = mime;
-    return mr;
+    return new MediaRecorder(streamRef.current!, { mimeType: mime });
   }
 
-  // --- TTS (com timeout + retry)
+  // --- TTS
   async function speak(text: string) {
     if (!text) return;
     try {
-      const r = await retry(
-        () =>
-          fetchWithTimeout("/api/tts", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text }),
-            timeoutMs: 25000, // TTS por vezes demora mais um pouco no 1º pedido
-            // keepalive ajuda em navegação/aba em segundo plano
-            keepalive: true,
-          }),
-        2,
-        400
-      );
+      const r = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+        // keepalive ajuda quando o tab fica em background
+        keepalive: true,
+      });
       if (!r.ok) {
         const txt = await r.text();
         setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
@@ -173,43 +118,35 @@ export default function Page() {
       }
 
       audio.src = url;
+
+      // Se o iPad bloquear, a próxima interação (clicar) deve libertar
       try {
         await audio.play();
-      } catch (e: any) {
-        // iOS/Safari a exigir gesto — na prática já temos (soltar hold), mas mostramos msg
+      } catch {
         setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
       }
     } catch (e: any) {
-      if (
-        e?.name === "AbortError" ||
-        /aborted/i.test(String(e?.message || e))
-      ) {
-        setStatus("⚠️ TTS abortado pela rede/navegador. Tenta de novo.");
-      } else {
-        setStatus("⚠️ Erro no TTS: " + (e?.message || e));
-      }
+      setStatus("⚠️ Erro no TTS: " + (e?.message || e));
     }
   }
 
-  // --- ALMA (com timeout + retry)
+  // Botão “Testar voz” — útil no iPad para aquecer a pipeline
+  async function testVoice() {
+    await speak("Olá! A minha voz está pronta.");
+  }
+
+  // --- ALMA
   async function askAlma(question: string) {
     setTranscript(question);
     setLog((l) => [...l, { role: "you", text: question }]);
-
     setStatus("🧠 A perguntar à Alma…");
     try {
-      const r = await retry(
-        () =>
-          fetchWithTimeout("/api/alma", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question }),
-            timeoutMs: 30000, // evita “read timeout 30s”
-            keepalive: true,
-          }),
-        1,
-        500
-      );
+      const r = await fetch("/api/alma", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+        keepalive: true,
+      });
       if (!r.ok) {
         const txt = await r.text();
         setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
@@ -223,18 +160,11 @@ export default function Page() {
       await speak(out);
       setStatus("Pronto");
     } catch (e: any) {
-      if (
-        e?.name === "AbortError" ||
-        /aborted/i.test(String(e?.message || e))
-      ) {
-        setStatus("⚠️ Pedido à Alma abortado pela rede/navegador. Tenta de novo.");
-      } else {
-        setStatus("⚠️ Erro: " + (e?.message || e));
-      }
+      setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
-  // --- Fluxo “segurar para falar” (batch)
+  // --- Push-to-talk (upload) — SEM streaming
   function startHold() {
     if (!isArmed) {
       requestMic();
@@ -246,17 +176,15 @@ export default function Page() {
     }
     try {
       setStatus("🎙️ A gravar…");
-      chunksRef.current = [];
       const mr = buildMediaRecorder();
       mediaRecorderRef.current = mr;
 
+      const chunks: BlobPart[] = [];
       mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
+        if (e.data && e.data.size > 0) chunks.push(e.data);
       };
       mr.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: mr.mimeType });
+        const blob = new Blob(chunks, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
       };
 
@@ -283,18 +211,7 @@ export default function Page() {
       fd.append("audio", blob, "audio.webm");
       fd.append("language", "pt-PT");
 
-      const sttResp = await retry(
-        () =>
-          fetchWithTimeout("/api/stt", {
-            method: "POST",
-            body: fd,
-            timeoutMs: 30000,
-            keepalive: true,
-          }),
-        1,
-        400
-      );
-
+      const sttResp = await fetch("/api/stt", { method: "POST", body: fd, keepalive: true });
       if (!sttResp.ok) {
         const txt = await sttResp.text();
         setTranscript("");
@@ -302,144 +219,19 @@ export default function Page() {
         return;
       }
 
-      const sttJson = (await sttResp.json()) as {
-        transcript?: string;
-        error?: string;
-      };
+      const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
       setTranscript(said);
       if (!said) {
-        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar um pouco mais perto.");
+        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar mais perto do micro.");
         return;
       }
 
       // 2) ALMA → 3) TTS
       await askAlma(said);
     } catch (e: any) {
-      if (
-        e?.name === "AbortError" ||
-        /aborted/i.test(String(e?.message || e))
-      ) {
-        setStatus("⚠️ STT abortado pela rede/navegador. Tenta de novo.");
-      } else {
-        setStatus("⚠️ Erro: " + (e?.message || e));
-      }
+      setStatus("⚠️ Erro: " + (e?.message || e));
     }
-  }
-
-  // ====== (opcional) Streaming WS mantém como tinhas; não mexi ======
-  async function ensureAudioContext() {
-    if (audioCtxRef.current) return audioCtxRef.current;
-    const ctx = new (window.AudioContext ||
-      (window as any).webkitAudioContext)({ sampleRate: 48000 });
-    audioCtxRef.current = ctx;
-    return ctx;
-  }
-
-  async function loadPcmWorklet(ctx: AudioContext) {
-    if (workletNodeRef.current) return;
-    const workletCode = `
-      class PCM16Downsampler extends AudioWorkletProcessor {
-        constructor(){ super(); this._inRate=sampleRate; this._outRate=16000; this._ratio=this._inRate/this._outRate; this._acc=0; }
-        process(inputs){
-          const input=inputs[0]; if(!input||!input[0]) return true;
-          const ch=input[0]; const out=[];
-          for(let i=0;i<ch.length;i++){ this._acc+=1; if(this._acc>=this._ratio){ this._acc-=this._ratio;
-            let s=Math.max(-1,Math.min(1,ch[i])); s=s<0? s*0x8000 : s*0x7FFF; out.push(s);
-          }}
-          if(out.length){
-            const arr=new Int16Array(out.length);
-            for(let i=0;i<out.length;i++) arr[i]=out[i]|0;
-            this.port.postMessage(arr.buffer,[arr.buffer]);
-          }
-          return true;
-        }
-      }
-      registerProcessor('pcm16-downsampler', PCM16Downsampler);
-    `;
-    const blob = new Blob([workletCode], { type: "application/javascript" });
-    const url = URL.createObjectURL(blob);
-    await (ctx.audioWorklet as any).addModule(url);
-    URL.revokeObjectURL(url);
-    workletNodeRef.current = new AudioWorkletNode(ctx, "pcm16-downsampler");
-  }
-
-  async function startStreaming() {
-    if (isStreaming) return;
-    if (!isArmed) {
-      await requestMic();
-      if (!streamRef.current) return;
-    }
-    if (!STT_WS_URL) {
-      setStatus("⚠️ NEXT_PUBLIC_STT_WS_URL não definido.");
-      return;
-    }
-
-    try {
-      setStatus("🔌 A ligar ao STT…");
-      const ctx = await ensureAudioContext();
-      await loadPcmWorklet(ctx);
-
-      const src = ctx.createMediaStreamSource(streamRef.current!);
-      sourceNodeRef.current = src;
-      const node = workletNodeRef.current!;
-      src.connect(node);
-
-      const ws = new WebSocket(STT_WS_URL);
-      ws.binaryType = "arraybuffer";
-
-      ws.onopen = () => {
-        setStatus("🟢 Streaming ligado. A enviar PCM16/16k…");
-        setIsStreaming(true);
-      };
-      ws.onerror = () => setStatus("⚠️ Erro no WebSocket STT.");
-      ws.onclose = () => {
-        setStatus("Streaming fechado.");
-        setIsStreaming(false);
-      };
-      ws.onmessage = async (ev) => {
-        if (typeof ev.data !== "string") return;
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === "transcript") {
-            setTranscript(msg.transcript || "");
-            if (msg.isFinal || msg.is_final) await askAlma(msg.transcript || "");
-          } else if (msg.type === "error") {
-            setStatus("⚠️ STT (WS): " + (msg.message || msg.error || "erro"));
-          }
-        } catch {}
-      };
-
-      node.port.onmessage = (e: MessageEvent) => {
-        const buf = e.data as ArrayBuffer;
-        if (ws.readyState === 1) ws.send(buf);
-      };
-
-      wsRef.current = ws;
-    } catch (e: any) {
-      setStatus("⚠️ Falha a iniciar streaming: " + (e?.message || e));
-      await stopStreaming();
-    }
-  }
-
-  async function stopStreaming() {
-    try {
-      wsRef.current?.send("stop");
-    } catch {}
-    try { wsRef.current?.close(); } catch {}
-    wsRef.current = null;
-
-    try { workletNodeRef.current?.port.close(); } catch {}
-    try { sourceNodeRef.current?.disconnect(); } catch {}
-    workletNodeRef.current = null;
-    sourceNodeRef.current = null;
-
-    setIsStreaming(false);
-  }
-
-  async function toggleStreaming() {
-    if (isStreaming) await stopStreaming();
-    else await startStreaming();
   }
 
   // --- Texto → Alma
@@ -450,7 +242,7 @@ export default function Page() {
     await askAlma(q);
   }
 
-  // Touch handlers para iOS (segurar)
+  // --- UI handlers (hold)
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -468,6 +260,7 @@ export default function Page() {
     });
   }
 
+  // --- UI
   return (
     <main
       style={{
@@ -484,7 +277,7 @@ export default function Page() {
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>🎭 Alma — Voz & Texto</h1>
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
-      {/* Controlo de micro + streaming */}
+      {/* Controlo de micro + teste de voz + hold */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
@@ -500,16 +293,16 @@ export default function Page() {
         </button>
 
         <button
-          onClick={toggleStreaming}
+          onClick={testVoice}
           style={{
             padding: "10px 14px",
             borderRadius: 8,
             border: "1px solid #444",
-            background: isStreaming ? "#004488" : "#333",
+            background: "#333",
             color: "#fff",
           }}
         >
-          {isStreaming ? "⏹️ Parar streaming" : "🔴 Iniciar streaming"}
+          🔊 Testar voz
         </button>
 
         <button
