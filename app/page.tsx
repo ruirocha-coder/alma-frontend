@@ -9,6 +9,11 @@ const STT_WS_URL =
   process.env.NEXT_PUBLIC_STT_WS_URL ||
   ""; // wss://<teu-ws>/stt
 
+// === Parâmetros anti-feedback (podes afinar) ===
+const VAD_THRESHOLD = 0.015;      // nível mínimo (~-36 dBFS) para considerar que o utilizador começou a falar
+const HANGOVER_MS   = 350;        // tempo extra de silêncio após TTS antes de reabrir o micro
+const IGNORE_WS_MS  = 400;        // durante este período após TTS, ignoramos mensagens do WS
+
 export default function Page() {
   // --- UI
   const [status, setStatus] = useState("Pronto");
@@ -20,24 +25,28 @@ export default function Page() {
   const [typed, setTyped] = useState("");
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // --- Áudio / refs
+  // --- Media / refs
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 
-  // TTS: <audio> + WebAudio fallback + warm-up
+  // TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const audioUnlockedRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const webAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-  // Streaming
+  // Streaming WS
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const workletLoadedRef = useRef(false);
 
-  // cria <audio> e desbloqueia iOS/Android + warm TTS
+  // Anti-feedback gates
+  const lastTtsEndAtRef = useRef<number>(0);   // timestamp quando o TTS terminou
+  const gateUntilRef    = useRef<number>(0);   // não enviar áudio ao WS até este timestamp
+
+  // cria <audio> + desbloqueio + warm TTS
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true;
@@ -55,21 +64,17 @@ export default function Page() {
         await audioCtxRef.current.resume();
       } catch {}
 
-      // “toque” para desbloquear <audio>
+      // “toque” mudo para desbloquear <audio>
       const el = ttsAudioRef.current!;
       el.muted = true;
-      try {
-        await el.play();
-      } catch {}
-      el.pause();
-      el.currentTime = 0;
-      el.muted = false;
+      try { await el.play(); } catch {}
+      el.pause(); el.currentTime = 0; el.muted = false;
 
-      // pré-aquecer TTS com um som curtíssimo que não tocamos (decode only)
+      // pré-aquecer TTS com um ponto (decode only)
       warmTTS().catch(() => {});
     };
 
-    const opts = { once: true } as AddEventListenerOptions;
+    const opts: AddEventListenerOptions = { once: true };
     window.addEventListener("click", unlock, opts);
     window.addEventListener("touchstart", unlock, opts);
     window.addEventListener("keydown", unlock, opts);
@@ -82,7 +87,6 @@ export default function Page() {
   }, []);
 
   async function warmTTS() {
-    // pede TTS de uma sílaba curta e decodifica sem tocar (para “aquecer” rede + decoder)
     try {
       const r = await fetch("/api/tts", {
         method: "POST",
@@ -93,7 +97,7 @@ export default function Page() {
       const ab = await r.arrayBuffer();
       try {
         const ctx = audioCtxRef.current!;
-        await ctx.decodeAudioData(ab.slice(0)); // só decode (cache interna do browser)
+        await ctx.decodeAudioData(ab.slice(0));
       } catch {}
     } catch {}
   }
@@ -103,7 +107,12 @@ export default function Page() {
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
+        audio: {
+          channelCount: 1,
+          noiseSuppression: true,
+          echoCancellation: true, // ajuda a reduzir retorno da coluna
+          autoGainControl: false,
+        },
         video: false,
       });
       streamRef.current = stream;
@@ -114,7 +123,7 @@ export default function Page() {
     }
   }
 
-  // ---- parar fala (para barge-in)
+  // ---- parar fala (barge-in + abre a janela de hangover)
   function stopSpeaking() {
     try { ttsAudioRef.current?.pause(); } catch {}
     if (ttsAudioRef.current) {
@@ -123,16 +132,16 @@ export default function Page() {
     try { webAudioSourceRef.current?.stop(); } catch {}
     webAudioSourceRef.current = null;
     isSpeakingRef.current = false;
+    gateUntilRef.current = Date.now() + HANGOVER_MS; // espera curto antes de reabrir envio
   }
 
-  // ---- TTS (com fallback WebAudio + barge-in cooperation)
+  // ---- TTS (com fallback WebAudio)
   async function speak(text: string) {
     if (!text) return;
     const audio = ttsAudioRef.current;
     if (!audio) { setStatus("⚠️ Áudio não inicializado."); return; }
 
     try {
-      setStatus("🔊 A falar…");
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -145,7 +154,7 @@ export default function Page() {
       }
       const ab = await r.arrayBuffer();
 
-      // Tenta <audio> primeiro
+      // Tenta <audio>
       try {
         const blob = new Blob([ab], { type: "audio/mpeg" });
         const url = URL.createObjectURL(blob);
@@ -153,26 +162,30 @@ export default function Page() {
         isSpeakingRef.current = true;
         const onEnded = () => {
           isSpeakingRef.current = false;
+          lastTtsEndAtRef.current = Date.now();
+          gateUntilRef.current = lastTtsEndAtRef.current + HANGOVER_MS;
           audio.removeEventListener("ended", onEnded);
-          setStatus("Pronto");
           URL.revokeObjectURL(url);
+          setStatus("Pronto");
         };
         audio.addEventListener("ended", onEnded);
         await audio.play();
         return;
       } catch {
-        // fallback WebAudio
+        // Fallback WebAudio
         try {
           const ctx = audioCtxRef.current!;
           await ctx.resume();
           const buf = await ctx.decodeAudioData(ab.slice(0));
-          isSpeakingRef.current = true;
           const src = ctx.createBufferSource();
           webAudioSourceRef.current = src;
+          isSpeakingRef.current = true;
           src.buffer = buf;
           src.connect(ctx.destination);
           src.onended = () => {
             isSpeakingRef.current = false;
+            lastTtsEndAtRef.current = Date.now();
+            gateUntilRef.current   = lastTtsEndAtRef.current + HANGOVER_MS;
             setStatus("Pronto");
           };
           src.start(0);
@@ -215,7 +228,7 @@ export default function Page() {
     }
   }
 
-  // ---- Push-to-talk (upload) — inalterado
+  // ---- Push-to-talk (upload) — mantido
   function buildMediaRecorder(): MediaRecorder {
     let mime = "";
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
@@ -227,7 +240,8 @@ export default function Page() {
     if (!isArmed) { requestMic(); return; }
     if (!streamRef.current) { setStatus("⚠️ Micro não está pronto."); return; }
     try {
-      stopSpeaking(); // barge-in: se estava a falar, pára já
+      // barge-in imediato
+      stopSpeaking();
       setStatus("🎙️ A gravar…");
       const mr = buildMediaRecorder();
       mediaRecorderRef.current = mr;
@@ -272,7 +286,7 @@ export default function Page() {
     }
   }
 
-  // ---- Streaming (PCM16 → WS) com detecção de voz (barge-in)
+  // ---- Streaming (PCM16 → WS) + VAD/anti-feedback
   async function ensureAudioContext() {
     if (audioCtxRef.current) return audioCtxRef.current;
     const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext || AudioContext;
@@ -283,21 +297,21 @@ export default function Page() {
   async function loadPcmWorklet(ctx: AudioContext) {
     if (workletLoadedRef.current) return;
 
-    // calcula RMS do frame 48k, downsample p/ 16k e envia {buf, level}
+    // Calcula RMS, downsample 48k -> 16k, envia {buf, level}
     const workletCode = `
       class PCM16Downsampler extends AudioWorkletProcessor {
         constructor(){ super(); this._ratio = sampleRate / 16000; this._acc = 0; }
         process(inputs){
           const i = inputs[0]; if(!i || !i[0]) return true;
           const ch = i[0];
-          // RMS em 48k (simples)
           let sum=0; for(let k=0;k<ch.length;k++){ const v=ch[k]; sum+=v*v; }
-          const rms = Math.sqrt(sum/Math.max(1,ch.length)); // ~0..1
-
-          // Downsample para 16k → Int16
-          const out=[]; for(let k=0;k<ch.length;k++){
+          const rms = Math.sqrt(sum/Math.max(1,ch.length));
+          const out=[];
+          for(let k=0;k<ch.length;k++){
             this._acc+=1; if(this._acc>=this._ratio){ this._acc-=this._ratio;
-              let s = Math.max(-1, Math.min(1, ch[k])); s = s<0 ? s*0x8000 : s*0x7FFF; out.push(s);
+              let s = Math.max(-1, Math.min(1, ch[k]));
+              s = s<0 ? s*0x8000 : s*0x7FFF;
+              out.push(s);
             }
           }
           if(out.length){
@@ -345,12 +359,19 @@ export default function Page() {
 
       ws.onmessage = async (ev) => {
         if (typeof ev.data !== "string") return;
-        if (isSpeakingRef.current) return; // anti-feedback: se a Alma fala, ignora STT
+
+        // Anti-feedback no lado do cliente:
+        const now = Date.now();
+        if (isSpeakingRef.current || now - lastTtsEndAtRef.current < IGNORE_WS_MS) {
+          // Estamos a falar ou ainda dentro da janela pós-TTS → ignora
+          return;
+        }
+
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.type === "partial") {
+          if (msg.type === "partial" && msg.transcript) {
             setTranscript((msg.transcript || "").trim());
-          } else if (msg.type === "utterance") {
+          } else if ((msg.type === "utterance" || msg.isFinal || msg.is_final) && msg.transcript) {
             const text = (msg.transcript || "").trim();
             if (text) { setTranscript(text); await askAlma(text); }
           } else if (msg.type === "error") {
@@ -359,16 +380,20 @@ export default function Page() {
         } catch {}
       };
 
-      // Recebe frames PCM + nível do micro
+      // Envio de frames com gate
       node.port.onmessage = (e: MessageEvent) => {
         const data = e.data as { buf: ArrayBuffer; level: number } | any;
-        const level = data?.level as number | undefined;
-        // barge-in: se o utilizador começou a falar com a Alma a falar, paramos a fala
-        if (isSpeakingRef.current && typeof level === "number" && level > 0.015) {
-          // limiar ~-36 dBFS; ajusta para o teu micro
-          stopSpeaking();
+        const now = Date.now();
+
+        // Se a Alma fala ou estamos na janela de hangover, não enviar nada
+        if (isSpeakingRef.current || now < gateUntilRef.current) return;
+
+        // Só abrir envio quando nível passa limiar (utilizador começou mesmo a falar)
+        if (typeof data?.level === "number" && data.level < VAD_THRESHOLD) {
+          return;
         }
-        if (data?.buf && ws.readyState === 1 && !isSpeakingRef.current) {
+
+        if (data?.buf && ws.readyState === 1) {
           try { ws.send(data.buf); } catch {}
         }
       };
@@ -401,18 +426,26 @@ export default function Page() {
     await askAlma(q);
   }
 
-  // ---- Push-to-talk (upload) – mantido
-  function onHoldStart(e: React.MouseEvent | React.TouchEvent) { e.preventDefault(); stopSpeaking(); startHold(); }
-  function onHoldEnd(e: React.MouseEvent | React.TouchEvent) { e.preventDefault(); stopHold(); }
+  // ---- Hold UI
+  function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
+    e.preventDefault();
+    stopSpeaking(); // barge-in instantâneo
+    startHold();
+  }
+  function onHoldEnd(e: React.MouseEvent | React.TouchEvent) {
+    e.preventDefault();
+    stopHold();
+  }
 
   function copyLog() {
     const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
     navigator.clipboard.writeText(txt).then(() => {
-      setStatus("Histórico copiado."); setTimeout(() => setStatus("Pronto"), 1200);
+      setStatus("Histórico copiado.");
+      setTimeout(() => setStatus("Pronto"), 1200);
     });
   }
 
-  // ---- UI (igual)
+  // ---- UI
   return (
     <main
       style={{
@@ -426,56 +459,87 @@ export default function Page() {
       <p style={{ opacity: 0.85, marginBottom: 16 }}>{status}</p>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
-        <button onClick={requestMic}
-          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
-            background: isArmed ? "#113311" : "#222", color: isArmed ? "#9BE29B" : "#fff" }}>
+        <button
+          onClick={requestMic}
+          style={{
+            padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
+            background: isArmed ? "#113311" : "#222", color: isArmed ? "#9BE29B" : "#fff",
+          }}
+        >
           {isArmed ? "Micro pronto ✅" : "Ativar micro"}
         </button>
 
-        <button onClick={toggleStreaming}
-          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
-            background: isStreaming ? "#004488" : "#333", color: "#fff" }}>
+        <button
+          onClick={toggleStreaming}
+          style={{
+            padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
+            background: isStreaming ? "#004488" : "#333", color: "#fff",
+          }}
+        >
           {isStreaming ? "⏹️ Parar streaming" : "🔴 Iniciar streaming"}
         </button>
 
         <button
-          onMouseDown={onHoldStart} onMouseUp={onHoldEnd}
-          onTouchStart={onHoldStart} onTouchEnd={onHoldEnd}
-          style={{ padding: "10px 14px", borderRadius: 999, border: "1px solid #444",
-            background: isRecording ? "#8b0000" : "#333", color: "#fff" }}
+          onMouseDown={onHoldStart}
+          onMouseUp={onHoldEnd}
+          onTouchStart={onHoldStart}
+          onTouchEnd={onHoldEnd}
+          style={{
+            padding: "10px 14px", borderRadius: 999, border: "1px solid #444",
+            background: isRecording ? "#8b0000" : "#333", color: "#fff",
+          }}
         >
           {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
         </button>
 
-        <button onClick={copyLog}
-          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
-            background: "#222", color: "#ddd" }}>
+        <button
+          onClick={copyLog}
+          style={{
+            padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
+            background: "#222", color: "#ddd",
+          }}
+        >
           Copiar histórico
         </button>
 
-        <button onClick={() => speak("Olá! Já estou pronta para falar contigo.")}
-          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
-            background: "#2b2bff", color: "#fff" }}>
+        <button
+          onClick={() => speak("Olá! Já estou pronta para falar contigo.")}
+          style={{
+            padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
+            background: "#2b2bff", color: "#fff",
+          }}
+        >
           Teste de voz
         </button>
       </div>
 
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
-          value={typed} onChange={(e) => setTyped(e.target.value)}
+          value={typed}
+          onChange={(e) => setTyped(e.target.value)}
           placeholder="Escreve aqui para perguntar à Alma…"
-          style={{ flex: 1, padding: "10px 12px", borderRadius: 8,
-            border: "1px solid #444", background: "#111", color: "#fff" }}
+          style={{
+            flex: 1, padding: "10px 12px", borderRadius: 8,
+            border: "1px solid #444", background: "#111", color: "#fff",
+          }}
           onKeyDown={(e) => { if (e.key === "Enter") sendTyped(); }}
         />
-        <button onClick={sendTyped}
-          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
-            background: "#2b2bff", color: "#fff" }}>
+        <button
+          onClick={sendTyped}
+          style={{
+            padding: "10px 14px", borderRadius: 8, border: "1px solid #444",
+            background: "#2b2bff", color: "#fff",
+          }}
+        >
           Enviar
         </button>
       </div>
 
-      <div style={{ border: "1px solid #333", borderRadius: 12, padding: 12, background: "#0f0f0f" }}>
+      <div
+        style={{
+          border: "1px solid #333", borderRadius: 12, padding: 12, background: "#0f0f0f",
+        }}
+      >
         <div style={{ marginBottom: 8 }}>
           <div style={{ fontWeight: 600, color: "#aaa" }}>Tu (último):</div>
           <div style={{ whiteSpace: "pre-wrap" }}>{transcript || "—"}</div>
