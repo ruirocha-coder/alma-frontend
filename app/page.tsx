@@ -9,75 +9,65 @@ const STT_WS_URL =
   process.env.NEXT_PUBLIC_STT_WS_URL ||
   ""; // ex.: wss://alma-stt-ws-xxxx.up.railway.app/stt
 
-// MP3 silencioso ~0.2s para desbloquear áudio no iOS
-const SILENT_MP3_DATA_URL =
-  "data:audio/mpeg;base64,//uQZAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAACcQCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
 export default function Page() {
-  // --- UI state
+  // --- UI
   const [status, setStatus] = useState("Pronto");
   const [isArmed, setIsArmed] = useState(false);
-  const [isRecording, setIsRecording] = useState(false); // push-to-talk
-  const [isStreaming, setIsStreaming] = useState(false); // streaming WS
-  const [audioUnlocked, setAudioUnlocked] = useState(false);
+  const [isRecording, setIsRecording] = useState(false); // hold-to-talk (upload)
+  const [isStreaming, setIsStreaming] = useState(false); // WS streaming
 
   const [transcript, setTranscript] = useState("");
   const [answer, setAnswer] = useState("");
   const [typed, setTyped] = useState("");
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // --- Media / refs
+  // --- Media
   const streamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null); // upload (push-to-talk)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+
+  // TTS
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Streaming (PCM 16 kHz)
+  // Streaming (PCM 16k via AudioWorklet)
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // gate para evitar feedback: se a Alma está a falar, não enviamos frames ao STT
-  const speakingRef = useRef(false);
-
-  // cria <audio> TTS
+  // ----- cria <audio> TTS + desbloqueia iOS
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true;
     a.autoplay = false;
     a.preload = "auto";
-    a.crossOrigin = "anonymous";
-    // quando começa a tocar -> estamos a falar (gate on)
-    a.addEventListener("play", () => {
-      speakingRef.current = true;
-    });
-    // quando termina -> gate off
-    const clearSpeaking = () => {
-      speakingRef.current = false;
-    };
-    a.addEventListener("ended", clearSpeaking);
-    a.addEventListener("pause", () => {
-      // se pausou porque terminou, ended já tratou; se foi interrupção, limpamos também
-      speakingRef.current = false;
-    });
     ttsAudioRef.current = a;
 
+    const unlock = () => {
+      const el = ttsAudioRef.current;
+      if (!el) return;
+      el.muted = true;
+      el.play().then(() => {
+        el.pause();
+        el.currentTime = 0;
+        el.muted = false;
+      }).catch(() => {});
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
+    };
+    document.addEventListener("click", unlock, { once: true });
+    document.addEventListener("touchstart", unlock, { once: true });
     return () => {
-      a.removeEventListener("ended", clearSpeaking);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
   }, []);
 
-  // --- Permissão do micro (echoCancellation ligado para reduzir feedback)
+  // ----- micro
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          noiseSuppression: true,
-          echoCancellation: true, // <— ligado
-          autoGainControl: false,
-        },
+        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
         video: false,
       });
       streamRef.current = stream;
@@ -88,34 +78,9 @@ export default function Page() {
     }
   }
 
-  // --- Botão para desbloquear áudio no iOS / browsers restritivos
-  async function unlockAudioPlayback() {
-    try {
-      if (!ttsAudioRef.current) return;
-      const audio = ttsAudioRef.current;
-      audio.src = SILENT_MP3_DATA_URL; // som silencioso, mas “real”
-      audio.muted = true;
-      await audio.play();
-      audio.pause();
-      audio.currentTime = 0;
-      audio.muted = false;
-      setAudioUnlocked(true);
-      setStatus("Áudio desbloqueado ✅");
-    } catch (e: any) {
-      setStatus("⚠️ Toca novamente para desbloquear áudio.");
-    }
-  }
-
-  // --- TTS (idêntico ao teu, mas com unlock obrigatório em iOS)
+  // ====== TTS
   async function speak(text: string) {
     if (!text) return;
-
-    // se ainda não desbloqueou no iOS, pede toque no botão
-    if (!audioUnlocked) {
-      setStatus("⚠️ Toca em “🔊 Desbloquear áudio” primeiro.");
-      return;
-    }
-
     try {
       const r = await fetch("/api/tts", {
         method: "POST",
@@ -124,26 +89,29 @@ export default function Page() {
       });
       if (!r.ok) {
         const txt = await r.text();
-        setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
+        setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 300)}`);
         return;
       }
       const ab = await r.arrayBuffer();
       const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
-      const audio = ttsAudioRef.current!;
+      const audio = ttsAudioRef.current;
+      if (!audio) {
+        setStatus("⚠️ Áudio não inicializado.");
+        return;
+      }
       audio.src = url;
-
       try {
         await audio.play();
       } catch {
-        setStatus("⚠️ O navegador bloqueou o áudio. Toca no botão “🔊 Desbloquear áudio”.");
+        setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
       }
     } catch (e: any) {
       setStatus("⚠️ Erro no TTS: " + (e?.message || e));
     }
   }
 
-  // --- ALMA (igual)
+  // ====== Alma
   async function askAlma(question: string) {
     setTranscript(question);
     setLog((l) => [...l, { role: "you", text: question }]);
@@ -156,7 +124,7 @@ export default function Page() {
       });
       if (!r.ok) {
         const txt = await r.text();
-        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
+        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 300));
         return;
       }
       const j = (await r.json()) as { answer?: string };
@@ -171,13 +139,22 @@ export default function Page() {
     }
   }
 
-  // --- Push-to-talk (upload) — igual ao teu
+  // ====== HOLD-TO-TALK (UPLOAD)
+
+  // >>> FIX principal: só aceitamos WebM/Opus, recusamos MP4/AAC (causa 400)
   function buildMediaRecorder(): MediaRecorder {
-    let mime = "";
-    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
-    else if (MediaRecorder.isTypeSupported("audio/webm")) mime = "audio/webm";
-    else mime = "audio/mp4"; // fallback Safari
-    return new MediaRecorder(streamRef.current!, { mimeType: mime });
+    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+      return new MediaRecorder(streamRef.current!, { mimeType: "audio/webm;codecs=opus" });
+    }
+    if (MediaRecorder.isTypeSupported("audio/webm")) {
+      return new MediaRecorder(streamRef.current!, { mimeType: "audio/webm" });
+    }
+    // Safari/Edge que só expõem MP4/AAC: avisar para usar Streaming
+    setStatus(
+      "⚠️ Este navegador só grava em MP4/AAC. Usa o botão 🔴 Iniciar streaming (PCM 16 kHz)."
+    );
+    throw new Error("MP4-only recording is not supported for /api/stt");
+    // (Se quiseres mesmo suportar, precisamos transcodificar para WAV no servidor)
   }
 
   function startHold() {
@@ -195,7 +172,9 @@ export default function Page() {
       mediaRecorderRef.current = mr;
 
       const chunks: BlobPart[] = [];
-      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
       mr.onstop = async () => {
         const blob = new Blob(chunks, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
@@ -203,9 +182,12 @@ export default function Page() {
       mr.start();
       setIsRecording(true);
     } catch (e: any) {
+      // Se caímos por falta de suporte (MP4-only)
+      if (e?.message?.includes("MP4-only")) return;
       setStatus("⚠️ Falha a iniciar gravação: " + (e?.message || e));
     }
   }
+
   function stopHold() {
     if (mediaRecorderRef.current && isRecording) {
       setStatus("⏳ A processar áudio…");
@@ -218,14 +200,14 @@ export default function Page() {
     try {
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
-      fd.append("audio", blob, "audio.webm");
+      fd.append("audio", blob, "audio.webm"); // WebM/Opus
       fd.append("language", "pt-PT");
 
       const sttResp = await fetch("/api/stt", { method: "POST", body: fd });
       if (!sttResp.ok) {
         const txt = await sttResp.text();
         setTranscript("");
-        setStatus("⚠️ STT " + sttResp.status + ": " + txt.slice(0, 200));
+        setStatus(`⚠️ STT ${sttResp.status}: ${txt.slice(0, 500)}`);
         return;
       }
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
@@ -240,16 +222,16 @@ export default function Page() {
     }
   }
 
-  // --- STREAMING PCM 16 kHz → alma-stt-ws
+  // ====== STREAMING (PCM 16 kHz → alma-stt-ws)
   async function ensureAudioContext() {
     if (audioCtxRef.current) return audioCtxRef.current;
-    const Ctor: any = (window as any).AudioContext || (window as any).webkitAudioContext;
-    const ctx = new Ctor({ sampleRate: 48000 });
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
+      sampleRate: 48000,
+    });
     audioCtxRef.current = ctx;
     return ctx;
   }
 
-  // Worklet para downsample 48k → 16k e enviar Int16
   async function loadPcmWorklet(ctx: AudioContext) {
     if (workletNodeRef.current) return;
 
@@ -257,15 +239,13 @@ export default function Page() {
       class PCM16Downsampler extends AudioWorkletProcessor {
         constructor() {
           super();
-          this._inRate = sampleRate;
-          this._outRate = 16000;
-          this._ratio = this._inRate / this._outRate;
+          this._ratio = sampleRate / 16000;
           this._acc = 0;
         }
         process(inputs) {
           const input = inputs[0];
           if (!input || !input[0]) return true;
-          const ch = input[0]; // mono
+          const ch = input[0];
           const out = [];
           for (let i = 0; i < ch.length; i++) {
             this._acc += 1;
@@ -288,7 +268,7 @@ export default function Page() {
     `;
     const blob = new Blob([workletCode], { type: "application/javascript" });
     const url = URL.createObjectURL(blob);
-    await (ctx as any).audioWorklet.addModule(url);
+    await (ctx.audioWorklet as any).addModule(url);
     URL.revokeObjectURL(url);
 
     const node = new AudioWorkletNode(ctx, "pcm16-downsampler");
@@ -309,39 +289,34 @@ export default function Page() {
     try {
       setStatus("🔌 A ligar ao STT…");
       const ctx = await ensureAudioContext();
-      if (ctx.state === "suspended") await ctx.resume();
       await loadPcmWorklet(ctx);
 
       const src = ctx.createMediaStreamSource(streamRef.current!);
       sourceNodeRef.current = src;
       const node = workletNodeRef.current!;
-      src.connect(node); // não ligar a destino (sem eco)
+      // só cadeia interna (sem som para as colunas)
+      src.connect(node);
 
       const ws = new WebSocket(STT_WS_URL);
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
-        setStatus("🟢 Streaming ligado. A enviar PCM16/16k…");
         setIsStreaming(true);
+        setStatus("🟢 Streaming ligado. A enviar PCM16/16k…");
       };
-      ws.onerror = (e) => {
-        console.warn("[WS] erro", e);
-        setStatus("⚠️ Erro no WebSocket STT.");
-      };
+      ws.onerror = () => setStatus("⚠️ Erro no WebSocket STT.");
       ws.onclose = () => {
-        setStatus("Streaming fechado.");
         setIsStreaming(false);
+        setStatus("Streaming fechado.");
       };
       ws.onmessage = async (ev) => {
         if (typeof ev.data !== "string") return;
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === "transcript") {
+            setTranscript(msg.transcript || "");
             if (msg.isFinal || msg.is_final) {
-              setTranscript(msg.transcript);
-              await askAlma(msg.transcript);
-            } else {
-              setTranscript(msg.transcript);
+              await askAlma(msg.transcript || "");
             }
           } else if (msg.type === "error") {
             setStatus("⚠️ STT (WS): " + (msg.message || msg.error || "erro"));
@@ -349,9 +324,7 @@ export default function Page() {
         } catch {}
       };
 
-      // Gate: se a Alma está a falar, não mandamos frames ao STT
       node.port.onmessage = (e: MessageEvent) => {
-        if (speakingRef.current) return; // corta envio durante TTS
         const buf = e.data as ArrayBuffer;
         if (ws.readyState === 1) ws.send(buf);
       };
@@ -364,17 +337,13 @@ export default function Page() {
   }
 
   async function stopStreaming() {
-    try {
-      wsRef.current?.send("stop");
-    } catch {}
+    try { wsRef.current?.send("stop"); } catch {}
     try { wsRef.current?.close(); } catch {}
     wsRef.current = null;
-
     try { workletNodeRef.current?.port.close(); } catch {}
     try { sourceNodeRef.current?.disconnect(); } catch {}
     workletNodeRef.current = null;
     sourceNodeRef.current = null;
-
     setIsStreaming(false);
   }
 
@@ -383,7 +352,7 @@ export default function Page() {
     else await startStreaming();
   }
 
-  // --- Texto → Alma
+  // ====== Texto → Alma
   async function sendTyped() {
     const q = typed.trim();
     if (!q) return;
@@ -391,7 +360,7 @@ export default function Page() {
     await askAlma(q);
   }
 
-  // --- UI handlers
+  // ====== UI handlers
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -408,7 +377,7 @@ export default function Page() {
     });
   }
 
-  // --- UI
+  // ====== UI
   return (
     <main
       style={{
@@ -437,19 +406,6 @@ export default function Page() {
           }}
         >
           {isArmed ? "Micro pronto ✅" : "Ativar micro"}
-        </button>
-
-        <button
-          onClick={unlockAudioPlayback}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: audioUnlocked ? "#113311" : "#333",
-            color: audioUnlocked ? "#9BE29B" : "#fff",
-          }}
-        >
-          🔊 {audioUnlocked ? "Áudio desbloqueado" : "Desbloquear áudio"}
         </button>
 
         <button
@@ -495,7 +451,6 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Entrada por texto */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <input
           value={typed}
@@ -527,7 +482,6 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Conversa simples */}
       <div
         style={{
           border: "1px solid #333",
