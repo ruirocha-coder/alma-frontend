@@ -1,12 +1,23 @@
 // app/api/alma/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit & { timeoutMs?: number } = {}
+) {
+  const { timeoutMs = 35000, ...rest } = init;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...rest, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-    const question: string = (body?.question || "").trim();
-    const context: string = (body?.context || "").trim();
-
+    const { question } = await req.json();
     const ALMA_URL =
       process.env.NEXT_PUBLIC_ALMA_SERVER_URL || process.env.ALMA_SERVER_URL;
 
@@ -17,18 +28,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Injeta contexto de forma segura (sem quebrar o server atual)
-    const qWithCtx = context
-      ? `Contexto (últimas mensagens):\n${context}\n\nPergunta: ${question}`
-      : question;
-
-    const r = await fetch(ALMA_URL, {
+    // 1 tentativa (podes pôr 2 se quiseres)
+    const r = await fetchWithTimeout(ALMA_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // o teu alma-server espera {question}
-      body: JSON.stringify({ question: qWithCtx }),
-      // não deixamos pendurado: 15s máx
-      signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined,
+      body: JSON.stringify({ question }),
+      timeoutMs: 35000,
     });
 
     if (!r.ok) {
@@ -42,6 +47,14 @@ export async function POST(req: NextRequest) {
     const j = await r.json();
     return NextResponse.json({ answer: j?.answer ?? "" });
   } catch (e: any) {
+    const aborted =
+      e?.name === "AbortError" || /aborted/i.test(String(e?.message || e));
+    if (aborted) {
+      return NextResponse.json(
+        { answer: "⚠️ Timeout ao contactar a Alma (request abortado). Tenta de novo." },
+        { status: 504 }
+      );
+    }
     return NextResponse.json(
       { answer: "Erro a contactar o Alma Server: " + (e?.message || e) },
       { status: 500 }
