@@ -24,11 +24,12 @@ export default function Page() {
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 
-  // TTS: <audio> + fallback WebAudio
+  // TTS: <audio> + WebAudio fallback + warm-up
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const audioUnlockedRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const webAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   // Streaming
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
@@ -36,7 +37,7 @@ export default function Page() {
   const wsRef = useRef<WebSocket | null>(null);
   const workletLoadedRef = useRef(false);
 
-  // cria <audio> e desbloqueia iOS/Android no 1º gesto
+  // cria <audio> e desbloqueia iOS/Android + warm TTS
   useEffect(() => {
     const a = new Audio();
     (a as any).playsInline = true;
@@ -46,23 +47,26 @@ export default function Page() {
 
     const unlock = async () => {
       if (audioUnlockedRef.current) return;
-      const el = ttsAudioRef.current;
-      if (!el) return;
       audioUnlockedRef.current = true;
-
       try {
-        // também acorda o AudioContext para fallback WebAudio
-        const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext || AudioContext;
+        const Ctx =
+          (window as any).AudioContext || (window as any).webkitAudioContext || AudioContext;
         if (!audioCtxRef.current) audioCtxRef.current = new Ctx({ sampleRate: 48000 });
         await audioCtxRef.current.resume();
       } catch {}
 
+      // “toque” para desbloquear <audio>
+      const el = ttsAudioRef.current!;
       el.muted = true;
-      el.play().then(() => {
-        el.pause();
-        el.currentTime = 0;
-        el.muted = false;
-      }).catch(() => { audioUnlockedRef.current = false; });
+      try {
+        await el.play();
+      } catch {}
+      el.pause();
+      el.currentTime = 0;
+      el.muted = false;
+
+      // pré-aquecer TTS com um som curtíssimo que não tocamos (decode only)
+      warmTTS().catch(() => {});
     };
 
     const opts = { once: true } as AddEventListenerOptions;
@@ -76,6 +80,23 @@ export default function Page() {
       window.removeEventListener("keydown", unlock);
     };
   }, []);
+
+  async function warmTTS() {
+    // pede TTS de uma sílaba curta e decodifica sem tocar (para “aquecer” rede + decoder)
+    try {
+      const r = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "." }),
+      });
+      if (!r.ok) return;
+      const ab = await r.arrayBuffer();
+      try {
+        const ctx = audioCtxRef.current!;
+        await ctx.decodeAudioData(ab.slice(0)); // só decode (cache interna do browser)
+      } catch {}
+    } catch {}
+  }
 
   // ---- Micro
   async function requestMic() {
@@ -93,7 +114,18 @@ export default function Page() {
     }
   }
 
-  // ---- TTS (com fallback WebAudio para iOS)
+  // ---- parar fala (para barge-in)
+  function stopSpeaking() {
+    try { ttsAudioRef.current?.pause(); } catch {}
+    if (ttsAudioRef.current) {
+      try { ttsAudioRef.current.currentTime = 0; } catch {}
+    }
+    try { webAudioSourceRef.current?.stop(); } catch {}
+    webAudioSourceRef.current = null;
+    isSpeakingRef.current = false;
+  }
+
+  // ---- TTS (com fallback WebAudio + barge-in cooperation)
   async function speak(text: string) {
     if (!text) return;
     const audio = ttsAudioRef.current;
@@ -113,12 +145,11 @@ export default function Page() {
       }
       const ab = await r.arrayBuffer();
 
-      // 1) tenta <audio> normal
+      // Tenta <audio> primeiro
       try {
         const blob = new Blob([ab], { type: "audio/mpeg" });
         const url = URL.createObjectURL(blob);
         audio.src = url;
-
         isSpeakingRef.current = true;
         const onEnded = () => {
           isSpeakingRef.current = false;
@@ -130,14 +161,14 @@ export default function Page() {
         await audio.play();
         return;
       } catch {
-        // 2) fallback WebAudio (iOS teimoso)
+        // fallback WebAudio
         try {
           const ctx = audioCtxRef.current!;
           await ctx.resume();
           const buf = await ctx.decodeAudioData(ab.slice(0));
           isSpeakingRef.current = true;
-
           const src = ctx.createBufferSource();
+          webAudioSourceRef.current = src;
           src.buffer = buf;
           src.connect(ctx.destination);
           src.onended = () => {
@@ -146,9 +177,9 @@ export default function Page() {
           };
           src.start(0);
           return;
-        } catch (e) {
-          setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
+        } catch {
           isSpeakingRef.current = false;
+          setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
           return;
         }
       }
@@ -178,13 +209,13 @@ export default function Page() {
       const out = (j.answer || "").trim();
       setAnswer(out);
       setLog((l) => [...l, { role: "alma", text: out }]);
-      await speak(out); // anti-feedback: enquanto fala, não enviamos áudio ao WS
+      await speak(out);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
     }
   }
 
-  // ---- Push-to-talk (upload)
+  // ---- Push-to-talk (upload) — inalterado
   function buildMediaRecorder(): MediaRecorder {
     let mime = "";
     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mime = "audio/webm;codecs=opus";
@@ -196,10 +227,10 @@ export default function Page() {
     if (!isArmed) { requestMic(); return; }
     if (!streamRef.current) { setStatus("⚠️ Micro não está pronto."); return; }
     try {
+      stopSpeaking(); // barge-in: se estava a falar, pára já
       setStatus("🎙️ A gravar…");
       const mr = buildMediaRecorder();
       mediaRecorderRef.current = mr;
-
       const chunks: BlobPart[] = [];
       mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
       mr.onstop = async () => {
@@ -241,7 +272,7 @@ export default function Page() {
     }
   }
 
-  // ---- Streaming (PCM16 → WS)
+  // ---- Streaming (PCM16 → WS) com detecção de voz (barge-in)
   async function ensureAudioContext() {
     if (audioCtxRef.current) return audioCtxRef.current;
     const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext || AudioContext;
@@ -251,18 +282,29 @@ export default function Page() {
   }
   async function loadPcmWorklet(ctx: AudioContext) {
     if (workletLoadedRef.current) return;
+
+    // calcula RMS do frame 48k, downsample p/ 16k e envia {buf, level}
     const workletCode = `
       class PCM16Downsampler extends AudioWorkletProcessor {
         constructor(){ super(); this._ratio = sampleRate / 16000; this._acc = 0; }
         process(inputs){
           const i = inputs[0]; if(!i || !i[0]) return true;
-          const ch = i[0], out = []; for(let k=0;k<ch.length;k++){ this._acc+=1;
-            if(this._acc>=this._ratio){ this._acc-=this._ratio;
+          const ch = i[0];
+          // RMS em 48k (simples)
+          let sum=0; for(let k=0;k<ch.length;k++){ const v=ch[k]; sum+=v*v; }
+          const rms = Math.sqrt(sum/Math.max(1,ch.length)); // ~0..1
+
+          // Downsample para 16k → Int16
+          const out=[]; for(let k=0;k<ch.length;k++){
+            this._acc+=1; if(this._acc>=this._ratio){ this._acc-=this._ratio;
               let s = Math.max(-1, Math.min(1, ch[k])); s = s<0 ? s*0x8000 : s*0x7FFF; out.push(s);
             }
           }
-          if(out.length){ const a=new Int16Array(out.length); for(let j=0;j<out.length;j++) a[j]=out[j]|0;
-            this.port.postMessage(a.buffer, [a.buffer]);
+          if(out.length){
+            const arr=new Int16Array(out.length);
+            for(let j=0;j<out.length;j++) arr[j]=out[j]|0;
+            const buf = arr.buffer;
+            this.port.postMessage({ buf, level: rms }, [buf]);
           }
           return true;
         }
@@ -303,29 +345,31 @@ export default function Page() {
 
       ws.onmessage = async (ev) => {
         if (typeof ev.data !== "string") return;
-        if (isSpeakingRef.current) return; // anti-feedback
+        if (isSpeakingRef.current) return; // anti-feedback: se a Alma fala, ignora STT
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === "partial") {
             setTranscript((msg.transcript || "").trim());
-            return;
-          }
-          if (msg.type === "utterance") {
+          } else if (msg.type === "utterance") {
             const text = (msg.transcript || "").trim();
             if (text) { setTranscript(text); await askAlma(text); }
-            return;
-          }
-          if (msg.type === "error") {
+          } else if (msg.type === "error") {
             setStatus("⚠️ STT (WS): " + (msg.message || msg.error || "erro"));
           }
         } catch {}
       };
 
+      // Recebe frames PCM + nível do micro
       node.port.onmessage = (e: MessageEvent) => {
-        if (isSpeakingRef.current) return; // não enviar frames enquanto a Alma fala
-        const buf = e.data as ArrayBuffer;
-        if (ws.readyState === 1) {
-          try { ws.send(buf); } catch {}
+        const data = e.data as { buf: ArrayBuffer; level: number } | any;
+        const level = data?.level as number | undefined;
+        // barge-in: se o utilizador começou a falar com a Alma a falar, paramos a fala
+        if (isSpeakingRef.current && typeof level === "number" && level > 0.015) {
+          // limiar ~-36 dBFS; ajusta para o teu micro
+          stopSpeaking();
+        }
+        if (data?.buf && ws.readyState === 1 && !isSpeakingRef.current) {
+          try { ws.send(data.buf); } catch {}
         }
       };
 
@@ -357,8 +401,8 @@ export default function Page() {
     await askAlma(q);
   }
 
-  // ---- UI handlers
-  function onHoldStart(e: React.MouseEvent | React.TouchEvent) { e.preventDefault(); startHold(); }
+  // ---- Push-to-talk (upload) – mantido
+  function onHoldStart(e: React.MouseEvent | React.TouchEvent) { e.preventDefault(); stopSpeaking(); startHold(); }
   function onHoldEnd(e: React.MouseEvent | React.TouchEvent) { e.preventDefault(); stopHold(); }
 
   function copyLog() {
@@ -368,7 +412,7 @@ export default function Page() {
     });
   }
 
-  // ---- UI
+  // ---- UI (igual)
   return (
     <main
       style={{
