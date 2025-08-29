@@ -5,22 +5,26 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-type AvatarCanvasProps = { audioLevelRef?: React.RefObject<number> };
-
 const AVATAR_URL =
+  process.env.NEXT_PUBLIC_RPM_GLTF_URL ||
   process.env.NEXT_PUBLIC_RPM_AVATAR_URL ||
-  "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb";
+  // TIP: acrescenta ?morphTargets=ARKit no teu URL real
+  "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit";
 
-/** Enquadra a câmara ao objeto com margem e um “zoomFactor” extra. */
+type MeshWithMorph = THREE.Mesh & {
+  morphTargetDictionary?: { [name: string]: number };
+  morphTargetInfluences?: number[];
+};
+
 function fitCameraToObject(
   camera: THREE.PerspectiveCamera,
   object: THREE.Object3D,
   controls: OrbitControls,
   renderer: THREE.WebGLRenderer,
   {
-    padding = 1.0, // margem (1 = sem margem extra)
-    yFocusBias = 0.5, // foca mais acima (0 = centro, 1 = topo)
-    zoomFactor = 0.7, // < 1 aproxima mais; > 1 afasta
+    padding = 0.95,
+    yFocusBias = 0.7,
+    zoomFactor = 0.6,
   }: { padding?: number; yFocusBias?: number; zoomFactor?: number }
 ) {
   const box = new THREE.Box3().setFromObject(object);
@@ -29,9 +33,8 @@ function fitCameraToObject(
   box.getSize(size);
   box.getCenter(center);
 
-  // alvo: um pouco acima do centro (cabeça/ombros)
   const target = center.clone();
-  target.y += size.y * (yFocusBias - 0.5); // mover para cima
+  target.y += size.y * (yFocusBias - 0.5);
 
   const fov = (camera.fov * Math.PI) / 180;
   const height = size.y * padding;
@@ -39,11 +42,8 @@ function fitCameraToObject(
   const distForHeight = height / (2 * Math.tan(fov / 2));
   const distForWidth = width / (2 * Math.tan((fov * camera.aspect) / 2));
   let distance = Math.max(distForHeight, distForWidth);
-
-  // aplica zoom extra
   distance *= zoomFactor;
 
-  // ligeiro ângulo superior
   const dir = new THREE.Vector3(0, 0.12, 1).normalize();
   const newPos = target.clone().add(dir.multiplyScalar(distance));
 
@@ -58,41 +58,28 @@ function fitCameraToObject(
   renderer.render(object.parent as THREE.Scene, camera);
 }
 
-export default function AvatarCanvas(_props: AvatarCanvasProps) {
+export default function AvatarCanvas() {
   const containerRef = useRef<HTMLDivElement | null>(null);
-
-  // refs para lipsync
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const srcNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const rmsRef = useRef(0); // nível suavizado 0..1
-
-  // target do blendshape
-  const jawTargetsRef = useRef<
-    { mesh: THREE.Mesh; index: number }[]
-  >([]);
 
   useEffect(() => {
     const el = containerRef.current!;
     const width = el.clientWidth;
     const height = el.clientHeight;
 
-    // Cena
+    // Scene / Camera / Renderer
     const scene = new THREE.Scene();
     scene.background = new THREE.Color("#0b0b0b");
 
-    // Câmara
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
     camera.position.set(0, 1.6, 2.0);
 
-    // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(width, height);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     el.appendChild(renderer.domElement);
 
-    // Luzes
+    // Lights
     const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 1.0);
     hemi.position.set(0, 2, 0);
     scene.add(hemi);
@@ -101,13 +88,37 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
     dir.position.set(2, 4, 2);
     scene.add(dir);
 
-    // Controlo de órbita (limitado)
+    // Controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.minPolarAngle = Math.PI * 0.15;
     controls.maxPolarAngle = Math.PI * 0.49;
     controls.minDistance = 0.6;
     controls.maxDistance = 4.0;
+
+    // Audio Analyser (para lipsync por amplitude)
+    let audioCtx: AudioContext | null = null;
+    let analyser: AnalyserNode | null = null;
+    let dataArray: Uint8Array | null = null;
+    let mediaElSource: MediaElementAudioSourceNode | null = null;
+
+    // Meshes/bones para lipsync
+    const candidateMorphNames = [
+      "jawOpen",
+      "mouthOpen",
+      "viseme_aa",
+      "MouthOpen",
+      "mouthOpen_BS",
+      "CC_Base_BlendShape.MouthOpen",
+      "Wolf3D_Avatar.MouthOpen",
+    ];
+
+    let mouthMeshes: MeshWithMorph[] = [];
+    let mouthMorphIndices: number[] = [];
+
+    // fallback se não houver morphs: tenta rodar mandíbula
+    let jawBone: THREE.Bone | null = null;
+    const jawBoneCandidates = ["jaw", "Jaw", "JawBone", "mixamorig:Head", "Head"]; // heurístico
 
     // Carregar GLB
     const loader = new GLTFLoader();
@@ -118,14 +129,10 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
       (gltf) => {
         avatar = gltf.scene;
 
-        // Esconder mãos (nomes comuns em ReadyPlayerMe)
+        // Esconder mãos
         avatar.traverse((o: any) => {
           const n = (o.name || "").toLowerCase();
-          if (
-            n.includes("hand") || // LeftHand / RightHand / mixamorig:RightHand
-            n.includes("wrist") || // Wrist joints
-            n.includes("wolf3d_hands") // alguns RPM exportam meshes com este nome
-          ) {
+          if (n.includes("hand") || n.includes("wrist") || n.includes("wolf3d_hands")) {
             o.visible = false;
           }
           if (o.isMesh) {
@@ -138,7 +145,7 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
           }
         });
 
-        // Normalizar escala para ~1.75m de altura
+        // Normalizar escala
         const tmpBox = new THREE.Box3().setFromObject(avatar);
         const tmpSize = new THREE.Vector3();
         tmpBox.getSize(tmpSize);
@@ -148,86 +155,74 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
 
         scene.add(avatar);
 
-        // Procurar blendshapes / morph targets de boca
-        jawTargetsRef.current = [];
+        // Procurar morphs de boca
+        mouthMeshes = [];
+        mouthMorphIndices = [];
         avatar.traverse((obj: any) => {
-          if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences) {
-            const dict = obj.morphTargetDictionary as Record<string, number>;
-            // chaves comuns RPM/ARKit: "jawOpen", "mouthOpen"
-            const keys = Object.keys(dict);
-            const findKey = (needle: string) =>
-              keys.find((k) => k.toLowerCase().includes(needle));
-            const mouthKey =
-              findKey("jawopen") ||
-              findKey("mouthopen") ||
-              findKey("jaw_open") ||
-              findKey("mouth_open");
-            if (mouthKey) {
-              const idx = dict[mouthKey];
+          const mesh = obj as MeshWithMorph;
+          if (mesh.isMesh && mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+            // tenta encontrar o primeiro morph que bata com os nomes candidatos
+            for (const name of candidateMorphNames) {
+              const idx = mesh.morphTargetDictionary[name];
               if (typeof idx === "number") {
-                jawTargetsRef.current.push({ mesh: obj as THREE.Mesh, index: idx });
+                mouthMeshes.push(mesh);
+                mouthMorphIndices.push(idx);
+                break; // usa o primeiro que existir neste mesh
               }
             }
           }
         });
 
-        // Enquadrar mais próximo e focado na cabeça
+        // se não houver morphs, tenta encontrar um osso de mandíbula para pequeno movimento
+        if (mouthMeshes.length === 0) {
+          avatar.traverse((obj: any) => {
+            if (obj.isBone) {
+              const nm = (obj.name || "");
+              if (jawBoneCandidates.some((c) => nm.includes(c))) {
+                jawBone = obj;
+              }
+            }
+          });
+        }
+
+        // Enquadrar
         fitCameraToObject(camera, avatar, controls, renderer, {
-          padding: 0.95, // pouca margem
-          yFocusBias: 0.7, // foca bem alto (cabeça)
-          zoomFactor: 0.6, // aproxima
+          padding: 0.95,
+          yFocusBias: 0.72,
+          zoomFactor: 0.58,
         });
+
+        // Ligar ao áudio do TTS
+        connectToTTSAudio();
       },
       undefined,
       (err) => console.error("Falha a carregar GLB:", err)
     );
 
-    // Ligação ao <audio id="alma-tts"> para lipsync
-    function connectToAlmaAudio() {
+    function connectToTTSAudio() {
       const elAudio = document.getElementById("alma-tts") as HTMLAudioElement | null;
-      if (!elAudio) return;
-
-      // cria/reutiliza AudioContext
-      let ctx = audioCtxRef.current;
-      if (!ctx) {
-        const AC = window.AudioContext || (window as any).webkitAudioContext;
-        ctx = new AC();
-        audioCtxRef.current = ctx;
+      if (!elAudio) {
+        // tenta mais tarde (quando o Page criar o <audio>)
+        setTimeout(connectToTTSAudio, 400);
+        return;
       }
 
-      // resume em iOS no gesto
-      const resume = () => {
-        ctx!.resume?.();
-        document.removeEventListener("touchstart", resume);
-        document.removeEventListener("click", resume);
-      };
-      document.addEventListener("touchstart", resume, { once: true });
-      document.addEventListener("click", resume, { once: true });
-
-      // criar nó de origem a partir do elemento <audio>
-      if (!srcNodeRef.current) {
-        srcNodeRef.current = ctx.createMediaElementSource(elAudio);
-      }
-      // analyser
-      if (!analyserRef.current) {
-        const a = ctx.createAnalyser();
-        a.fftSize = 2048;
-        a.smoothingTimeConstant = 0.8;
-        analyserRef.current = a;
-      }
-
-      // pipeline: element -> analyser -> destination
       try {
-        srcNodeRef.current.disconnect();
-      } catch {}
-      srcNodeRef.current.connect(analyserRef.current!);
-      analyserRef.current!.connect(ctx.destination);
-    }
+        audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.minDecibels = -85;
+        analyser.maxDecibels = -10;
+        analyser.smoothingTimeConstant = 0.6;
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-    // tentar ligar já e também quando o áudio fizer play
-    connectToAlmaAudio();
-    const onAudioPlayTryConnect = () => connectToAlmaAudio();
-    document.addEventListener("play", onAudioPlayTryConnect, true);
+        mediaElSource = audioCtx.createMediaElementSource(elAudio);
+        mediaElSource.connect(analyser);
+        analyser.connect(audioCtx.destination); // opcional (para “ouvir” via contexto)
+      } catch (e) {
+        console.warn("Não consegui ligar Analyser ao audio do TTS:", e);
+      }
+    }
 
     // Resize
     const onResize = () => {
@@ -236,11 +231,12 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+
       if (avatar) {
         fitCameraToObject(camera, avatar, controls, renderer, {
           padding: 0.95,
-          yFocusBias: 0.7,
-          zoomFactor: 0.6,
+          yFocusBias: 0.72,
+          zoomFactor: 0.58,
         });
       }
     };
@@ -249,34 +245,36 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
 
     // Loop
     let raf = 0;
-    const timeLerp = (from: number, to: number, t: number) => from + (to - from) * t;
-    const freq = new Uint8Array(256);
-
     const tick = () => {
-      // lipsync: calcular RMS simples do espectro → suavizar → mapear 0..1
-      if (analyserRef.current && jawTargetsRef.current.length > 0) {
-        analyserRef.current.getByteFrequencyData(freq);
+      controls.update();
+
+      // Lipsync simples por amplitude
+      if (analyser && dataArray) {
+        analyser.getByteTimeDomainData(dataArray);
+        // RMS rápido
         let sum = 0;
-        for (let i = 0; i < freq.length; i++) {
-          const v = freq[i] / 255; // 0..1
+        for (let i = 0; i < dataArray.length; i++) {
+          const v = (dataArray[i] - 128) / 128; // [-1..1]
           sum += v * v;
         }
-        const rms = Math.sqrt(sum / freq.length); // 0..1
-        // compressão suave para abrir mais a boca com volumes moderados
-        const target = Math.min(1, Math.max(0, (rms - 0.05) * 2.5));
-        // suavização temporal (menos “tremeliques”)
-        rmsRef.current = timeLerp(rmsRef.current, target, 0.2);
+        const rms = Math.sqrt(sum / dataArray.length); // 0..~1
+        // normalizar e comprimir um bocado
+        let open = Math.min(1, Math.max(0, (rms - 0.02) * 8));
 
-        // aplicar em todas as malhas que tenham o morph
-        const open = rmsRef.current;
-        for (const { mesh, index } of jawTargetsRef.current) {
-          if (mesh.morphTargetInfluences) {
-            mesh.morphTargetInfluences[index] = open;
+        if (mouthMeshes.length && mouthMorphIndices.length) {
+          for (let i = 0; i < mouthMeshes.length; i++) {
+            const m = mouthMeshes[i];
+            const idx = mouthMorphIndices[i];
+            if (m.morphTargetInfluences) {
+              m.morphTargetInfluences[idx] = open;
+            }
           }
+        } else if (jawBone) {
+          // fallback: roda ligeiramente a mandíbula
+          jawBone.rotation.x = -open * 0.25; // ~14º
         }
       }
 
-      controls.update();
       renderer.render(scene, camera);
       raf = requestAnimationFrame(tick);
     };
@@ -286,20 +284,11 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
-      document.removeEventListener("play", onAudioPlayTryConnect, true);
-
-      // desligar audio graph
       try {
-        analyserRef.current?.disconnect();
+        if (mediaElSource) mediaElSource.disconnect();
+        if (analyser) analyser.disconnect();
+        if (audioCtx) audioCtx.close();
       } catch {}
-      try {
-        srcNodeRef.current?.disconnect();
-      } catch {}
-      analyserRef.current = null;
-      srcNodeRef.current = null;
-      // não fechamos o AudioContext para poder ser reutilizado
-
-      // three cleanup
       el.removeChild(renderer.domElement);
       renderer.dispose();
       scene.traverse((obj: any) => {
@@ -312,6 +301,6 @@ export default function AvatarCanvas(_props: AvatarCanvasProps) {
     };
   }, []);
 
-  // container ocupa o espaço que o pai der
+  // Ocupa toda a altura disponível do “slot” do container no Page
   return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
 }
