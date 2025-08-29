@@ -9,17 +9,16 @@ const AVATAR_URL =
   process.env.NEXT_PUBLIC_RPM_AVATAR_URL ||
   "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb";
 
-/** Enquadra a câmara ao objeto com margem e “zoomFactor”. */
+type Props = {
+  audioLevelRef?: React.MutableRefObject<number>; // 0..1
+};
+
 function fitCameraToObject(
   camera: THREE.PerspectiveCamera,
   object: THREE.Object3D,
   controls: OrbitControls,
   renderer: THREE.WebGLRenderer,
-  {
-    padding = 1.0,
-    yFocusBias = 0.5,
-    zoomFactor = 0.7,
-  }: { padding?: number; yFocusBias?: number; zoomFactor?: number }
+  { padding = 1.0, yFocusBias = 0.5, zoomFactor = 0.7 }: { padding?: number; yFocusBias?: number; zoomFactor?: number }
 ) {
   const box = new THREE.Box3().setFromObject(object);
   const size = new THREE.Vector3();
@@ -53,7 +52,7 @@ function fitCameraToObject(
   renderer.render(object.parent as THREE.Scene, camera);
 }
 
-export default function AvatarCanvas() {
+export default function AvatarCanvas({ audioLevelRef }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -99,6 +98,34 @@ export default function AvatarCanvas() {
     let mixer: THREE.AnimationMixer | null = null;
     let clock = new THREE.Clock();
 
+    // LIPSYNC targets
+    let jawBone: THREE.Bone | null = null;
+    const morphTargets: { mesh: THREE.Mesh; index: number }[] = [];
+
+    function collectLipTargets(root: THREE.Object3D) {
+      root.traverse((o: any) => {
+        // procurar ‘jaw’ bone
+        if (o.isBone && typeof o.name === "string") {
+          const n = o.name.toLowerCase();
+          if (n.includes("jaw")) jawBone = o;
+        }
+        // morph targets
+        if (o.isMesh && o.morphTargetDictionary && o.morphTargetInfluences) {
+          const dict = o.morphTargetDictionary as Record<string, number>;
+          const names = Object.keys(dict);
+          // comuns: jawOpen, mouthOpen, viseme_*
+          const candidatas = names.filter(
+            (k) =>
+              /jawopen|mouthopen|viseme_/i.test(k) ||
+              /mouth/i.test(k)
+          );
+          candidatas.forEach((name) => {
+            morphTargets.push({ mesh: o, index: dict[name] });
+          });
+        }
+      });
+    }
+
     loader.load(
       AVATAR_URL,
       (gltf) => {
@@ -136,15 +163,15 @@ export default function AvatarCanvas() {
           zoomFactor: 0.6,
         });
 
-        // Animação: usa o primeiro clip se existir, senão idle suave
+        // Mixer se houver animações
         if (gltf.animations && gltf.animations.length > 0) {
           mixer = new THREE.AnimationMixer(avatar);
           const action = mixer.clipAction(gltf.animations[0]);
           action.play();
-        } else {
-          // “idle” manual (respiração/cabeça)
-          mixer = null; // não precisamos de mixer
         }
+
+        // recolher targets de boca
+        collectLipTargets(avatar);
       },
       undefined,
       (err) => console.error("Falha a carregar GLB:", err)
@@ -172,15 +199,23 @@ export default function AvatarCanvas() {
     let raf = 0;
     const tick = () => {
       const dt = clock.getDelta();
-      if (mixer) {
-        mixer.update(dt);
-      } else if (avatar) {
-        // “idle” suave se não houver clips
-        const t = performance.now() * 0.001;
-        const head = avatar; // aplica no grupo todo (leve)
-        head.rotation.y = Math.sin(t * 0.3) * 0.02;
-        head.position.y = Math.sin(t * 0.8) * 0.01;
-      }
+      if (mixer) mixer.update(dt);
+
+      // LIPSYNC: aplicar nível (0..1) → boca
+      const lvl = audioLevelRef?.current ?? 0;
+      const open = Math.min(1, lvl * 1.2); // leve ganho
+
+      if (morphTargets.length > 0) {
+        for (const { mesh, index } of morphTargets) {
+          if (mesh.morphTargetInfluences) {
+            mesh.morphTargetInfluences[index] = open;
+          }
+        }
+      } else if (jawBone) {
+        // rodar a mandíbula um pouco
+        jawBone.rotation.x = open * 0.25; // ~14°
+      } // senão, nada (avatar sem rig de boca)
+
       controls.update();
       renderer.render(scene, camera);
       raf = requestAnimationFrame(tick);
@@ -201,7 +236,7 @@ export default function AvatarCanvas() {
         }
       });
     };
-  }, []);
+  }, [audioLevelRef]);
 
   return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
 }
