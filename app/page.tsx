@@ -1,95 +1,85 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import AvatarCanvas from "../components/AvatarCanvas"; // <- relativo (evita erro do "@/")
+import AvatarCanvas from "../components/AvatarCanvas";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
 export default function Page() {
   // --- UI state
   const [status, setStatus] = useState<string>("Pronto");
-  const [isArmed, setIsArmed] = useState(false); // micro ativado
+  const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
-
-  // entrada por texto
   const [typed, setTyped] = useState("");
 
-  // histórico
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // --- Audio / Recorder refs
+  // --- Audio / Recorder
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
 
-  // Audio element para TTS
+  // TTS player
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // cria o <audio> de TTS uma vez
+  // cria <audio> e deixa visível no DOM (controls escondidos), ajuda iOS
   useEffect(() => {
-    const a = new Audio();
-    // Safari iOS: a propriedade playsInline não existe no tipo TS de <audio>,
-    // forçamos via cast para não falhar no build.
-    (a as any).playsInline = true;
-    a.autoplay = false;
-    a.preload = "auto";
-    ttsAudioRef.current = a;
+    const el = document.getElementById("tts-audio") as HTMLAudioElement | null;
+    if (el) {
+      ttsAudioRef.current = el;
+      (el as any).playsInline = true;
+      el.autoplay = false;
+      el.preload = "auto";
+      el.crossOrigin = "anonymous";
+    }
 
-    // desbloqueio de áudio no iOS: preparar um pequeno som silencioso on user-gesture
-    const unlockAudio = () => {
-      if (!ttsAudioRef.current) return;
+    // desbloqueio no primeiro toque
+    const unlock = () => {
+      const a = ttsAudioRef.current;
+      if (!a) return;
       try {
-        ttsAudioRef.current.muted = true;
-        ttsAudioRef.current
+        a.muted = true;
+        a
           .play()
           .then(() => {
-            ttsAudioRef.current!.pause();
-            ttsAudioRef.current!.currentTime = 0;
-            ttsAudioRef.current!.muted = false;
+            a.pause();
+            a.currentTime = 0;
+            a.muted = false;
           })
           .catch(() => {});
       } catch {}
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
-    document.addEventListener("click", unlockAudio, { once: true });
-    document.addEventListener("touchstart", unlockAudio, { once: true });
+    document.addEventListener("click", unlock, { once: true });
+    document.addEventListener("touchstart", unlock, { once: true });
 
     return () => {
-      document.removeEventListener("click", unlockAudio);
-      document.removeEventListener("touchstart", unlockAudio);
+      document.removeEventListener("click", unlock);
+      document.removeEventListener("touchstart", unlock);
     };
   }, []);
 
-  // --- Helpers
-
+  // --- Microfone
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
-      // áudio apenas, sem echoCancellation para não distorcer (podes ligar se quiseres)
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          noiseSuppression: true,
-          echoCancellation: false,
-        },
+        audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
         video: false,
       });
       streamRef.current = stream;
       setIsArmed(true);
       setStatus("Micro pronto. Mantém o botão para falar.");
-    } catch (e: any) {
-      setStatus(
-        "⚠️ Permissão do micro negada. Abre as definições do navegador e permite acesso ao micro."
-      );
+    } catch {
+      setStatus("⚠️ Permissão do micro negada. Ativa nas definições do navegador.");
     }
   }
 
   function startHold() {
     if (!isArmed) {
-      // primeira interação: ativar micro
       requestMic();
       return;
     }
@@ -106,15 +96,13 @@ export default function Page() {
           ? "audio/webm;codecs=opus"
           : MediaRecorder.isTypeSupported("audio/webm")
           ? "audio/webm"
-          : "audio/mp4"; // fallback para Safari
+          : "audio/mp4"; // fallback Safari
 
       const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
       mediaRecorderRef.current = mr;
 
       mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
       };
       mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: mr.mimeType });
@@ -156,7 +144,7 @@ export default function Page() {
       setTranscript(said);
       setLog((l) => (said ? [...l, { role: "you", text: said }] : l));
       if (!said) {
-        setStatus("⚠️ Não consegui transcrever o áudio. Tenta falar um pouco mais perto.");
+        setStatus("⚠️ Não consegui transcrever o áudio. Fala mais perto do micro.");
         return;
       }
 
@@ -173,7 +161,6 @@ export default function Page() {
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // se o backend /api/tts aceitar voiceId/model, podes adicionar aqui
         body: JSON.stringify({ text }),
       });
       if (!r.ok) {
@@ -191,11 +178,12 @@ export default function Page() {
         return;
       }
 
+      // Carregar e tocar com user-gesture recente
       audio.src = url;
-      // Em iOS, o play precisa de gesto do utilizador recente. O "soltar" do hold costuma chegar.
       try {
         await audio.play();
-      } catch (e: any) {
+      } catch {
+        // fallback: força play após um tap explícito no ecrã
         setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
       }
     } catch (e: any) {
@@ -203,10 +191,15 @@ export default function Page() {
     }
   }
 
+  async function testVoice() {
+    setStatus("🔊 A testar voz…");
+    await speak("Olá! Sou a Alma. Estás a ouvir bem?");
+    setStatus("Pronto");
+  }
+
   async function askAlma(question: string) {
     setStatus("🧠 A perguntar à Alma…");
     setAnswer("");
-
     try {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
@@ -223,8 +216,6 @@ export default function Page() {
       setAnswer(out);
       setLog((l) => [...l, { role: "alma", text: out }]);
       setStatus("🔊 A falar…");
-
-      // 3) TTS
       await speak(out);
       setStatus("Pronto");
     } catch (e: any) {
@@ -295,7 +286,7 @@ export default function Page() {
         minHeight: "100vh",
       }}
     >
-      {/* AVATAR NO TOPO */}
+      {/* AVATAR */}
       <div
         style={{
           width: "100%",
@@ -310,7 +301,9 @@ export default function Page() {
         <AvatarCanvas />
       </div>
 
-      {/* (Sem título/emoji) */}
+      {/* player TTS no DOM (hidden-ish) */}
+      <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
+
       <p style={{ opacity: 0.8, marginBottom: 16 }}>{status}</p>
 
       {/* Controlo de micro */}
@@ -326,6 +319,19 @@ export default function Page() {
           }}
         >
           {isArmed ? "Micro pronto ✅" : "Ativar micro"}
+        </button>
+
+        <button
+            onClick={testVoice}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 8,
+              border: "1px solid #444",
+              background: "#333",
+              color: "#fff",
+            }}
+        >
+          Testar voz
         </button>
 
         <button
@@ -346,9 +352,10 @@ export default function Page() {
 
         <button
           onClick={() => {
-            if (ttsAudioRef.current) {
-              ttsAudioRef.current.pause();
-              ttsAudioRef.current.currentTime = 0;
+            const a = ttsAudioRef.current;
+            if (a) {
+              a.pause();
+              a.currentTime = 0;
             }
           }}
           style={{
