@@ -10,63 +10,30 @@ const AVATAR_URL =
   "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb";
 
 type Props = {
-  /** 0..1 (vem do page.tsx via WebAudio analyser do <audio> TTS) */
-  audioLevelRef?: React.MutableRefObject<number>;
+  /** Opcional: nível de áudio 0..1 vindo do page (se existir) */
+  audioLevelRef?: React.RefObject<number>;
+  /** Opcional: id do <audio> para o canvas auto-ligar o analyser (fallback) */
+  audioElementId?: string; // por defeito "alma-tts"
 };
 
-/** Enquadra a câmara ao objeto com margem e um “zoomFactor” extra. */
-function fitCameraToObject(
-  camera: THREE.PerspectiveCamera,
-  object: THREE.Object3D,
-  controls: OrbitControls,
-  renderer: THREE.WebGLRenderer,
-  {
-    padding = 1.0,
-    yFocusBias = 0.5,
-    zoomFactor = 0.7,
-  }: { padding?: number; yFocusBias?: number; zoomFactor?: number }
-) {
-  const box = new THREE.Box3().setFromObject(object);
-  const size = new THREE.Vector3();
-  const center = new THREE.Vector3();
-  box.getSize(size);
-  box.getCenter(center);
+/** Util: encontra índices de blendshapes relevantes num mesh com morph targets */
+function findBlendshapeIndices(mesh: THREE.Mesh) {
+  const dict = mesh.morphTargetDictionary || {};
+  const idx = (name: string) =>
+    typeof (dict as any)[name] === "number" ? (dict as any)[name] : -1;
 
-  const target = center.clone();
-  target.y += size.y * (yFocusBias - 0.5);
-
-  const fov = (camera.fov * Math.PI) / 180;
-  const height = size.y * padding;
-  const width = size.x * padding;
-  const distForHeight = height / (2 * Math.tan(fov / 2));
-  const distForWidth = width / (2 * Math.tan((fov * camera.aspect) / 2));
-  let distance = Math.max(distForHeight, distForWidth);
-  distance *= zoomFactor;
-
-  const dir = new THREE.Vector3(0, 0.12, 1).normalize();
-  const newPos = target.clone().add(dir.multiplyScalar(distance));
-
-  camera.position.copy(newPos);
-  camera.near = Math.max(0.01, distance / 100);
-  camera.far = distance * 100;
-  camera.updateProjectionMatrix();
-
-  controls.target.copy(target);
-  controls.update();
-
-  renderer.render(object.parent as THREE.Scene, camera);
+  return {
+    jawOpen: idx("jawOpen") !== -1 ? idx("jawOpen") : idx("MouthOpen"),
+    // alguns RPM usam visemes
+    viseme_aa: idx("viseme_aa"),
+    viseme_A: idx("viseme_A"),
+    // cantos dos lábios para um pouco de vida
+    mouthSmile: idx("mouthSmile"),
+    mouthFrown: idx("mouthFrown"),
+  };
 }
 
-/** Estruturas para *lipsync* */
-type MorphTargetRef = { mesh: THREE.Mesh; index: number; name: string };
-type LipRig = {
-  openPrimary?: MorphTargetRef;   // jawOpen/mouthOpen/viseme_*
-  openSecondary?: MorphTargetRef; // viseme secundário, opcional
-  mouthClose?: MorphTargetRef;    // se existir, animamos ao inverso
-  jawBone?: THREE.Bone;           // fallback: rodar mandíbula
-};
-
-export default function AvatarCanvas({ audioLevelRef }: Props) {
+export default function AvatarCanvas({ audioLevelRef, audioElementId = "alma-tts" }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -89,15 +56,16 @@ export default function AvatarCanvas({ audioLevelRef }: Props) {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     el.appendChild(renderer.domElement);
 
-    // Luzes
+    // Luzes simples
     const hemi = new THREE.HemisphereLight(0xffffff, 0x222233, 1.0);
     hemi.position.set(0, 2, 0);
     scene.add(hemi);
+
     const dir = new THREE.DirectionalLight(0xffffff, 1.0);
     dir.position.set(2, 4, 2);
     scene.add(dir);
 
-    // Controlo
+    // Controlo de órbita
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.minPolarAngle = Math.PI * 0.15;
@@ -105,72 +73,91 @@ export default function AvatarCanvas({ audioLevelRef }: Props) {
     controls.minDistance = 0.6;
     controls.maxDistance = 4.0;
 
+    // Analyser (fallback interno)
+    const audioCtxRef: { current: AudioContext | null } = { current: null };
+    const analyserRef: { current: AnalyserNode | null } = { current: null };
+    const srcNodeRef: { current: MediaElementAudioSourceNode | null } = { current: null };
+    let levelInternal = 0;
+
+    function attachAnalyserToAudio() {
+      try {
+        const elAudio = document.getElementById(audioElementId) as HTMLAudioElement | null;
+        if (!elAudio) return;
+
+        if (!audioCtxRef.current) {
+          audioCtxRef.current = new (window.AudioContext ||
+            (window as any).webkitAudioContext)();
+        }
+        const ctx = audioCtxRef.current!;
+        if (!analyserRef.current) {
+          const src = ctx.createMediaElementSource(elAudio);
+          const an = ctx.createAnalyser();
+          an.fftSize = 1024;
+          src.connect(an);
+          // NÃO ligar a destination para não duplicar som no sistema
+          analyserRef.current = an;
+          srcNodeRef.current = src;
+        }
+      } catch {
+        // ignora — não falhamos só por não ter analyser interno
+      }
+    }
+
     // Carregar GLB
     const loader = new GLTFLoader();
     let avatar: THREE.Group | null = null;
-    let mixer: THREE.AnimationMixer | null = null;
-    const clock = new THREE.Clock();
 
-    // Lip rig encontrado no modelo
-    const lipRig: LipRig = {};
-    // nível suavizado para abrir/fechar de forma natural
-    let smoothOpen = 0;
+    // Guardar meshes com morphs
+    const morphMeshes: { mesh: THREE.Mesh; idx: ReturnType<typeof findBlendshapeIndices> }[] = [];
 
-    function nameMatch(n: string, ...needles: string[]) {
-      const L = n.toLowerCase();
-      return needles.some((k) => L.includes(k));
-    }
-
-    function collectLipTargets(root: THREE.Object3D) {
+    function collectMorphMeshes(root: THREE.Object3D) {
+      morphMeshes.length = 0;
       root.traverse((o: any) => {
-        // osso da mandíbula
-        if (o.isBone && typeof o.name === "string") {
-          const n = o.name.toLowerCase();
-          if (!lipRig.jawBone && nameMatch(n, "jaw", "lowerjaw", "mandible", "chin")) {
-            lipRig.jawBone = o as THREE.Bone;
-          }
+        const n = (o.name || "").toLowerCase();
+        // esconder mãos (como já tinhas)
+        if (n.includes("hand") || n.includes("wrist") || n.includes("wolf3d_hands")) {
+          o.visible = false;
         }
-
-        // morphs
-        if (o.isMesh && o.morphTargetDictionary && o.morphTargetInfluences) {
-          const dict = o.morphTargetDictionary as Record<string, number>;
-          const addIf = (preds: RegExp[] | string[], assign: (ref: MorphTargetRef) => void) => {
-            for (const key of Object.keys(dict)) {
-              const low = key.toLowerCase();
-              const ok = Array.isArray(preds)
-                ? (preds as any).some((p: any) => (p.test ? p.test(low) : low.includes(p)))
-                : (low.includes(preds as any));
-              if (ok) {
-                assign({ mesh: o, index: dict[key], name: key });
-                return true;
-              }
-            }
-            return false;
-          };
-
-          // prioridade para abrir boca
-          // 1) jawOpen
-          if (!lipRig.openPrimary) {
-            addIf(["jawopen"], (ref) => (lipRig.openPrimary = ref));
-          }
-          // 2) mouthOpen
-          if (!lipRig.openPrimary) {
-            addIf(["mouthopen"], (ref) => (lipRig.openPrimary = ref));
-          }
-          // 3) visemes típicos (aa, oh) — muitos RPM exportam
-          if (!lipRig.openPrimary) {
-            addIf([/viseme_aa/, /viseme_oh/], (ref) => (lipRig.openPrimary = ref));
-          }
-          // secundário para variação (ih/ee) se existir
-          if (!lipRig.openSecondary) {
-            addIf([/viseme_ih/, /viseme_ee/, /viseme_ao/, /viseme_uw/], (ref) => (lipRig.openSecondary = ref));
-          }
-          // fechar boca (inverso)
-          if (!lipRig.mouthClose) {
-            addIf(["mouthclose", "lipsclosed"], (ref) => (lipRig.mouthClose = ref));
-          }
+        if (o.isMesh && o.morphTargetInfluences && o.morphTargetDictionary) {
+          morphMeshes.push({ mesh: o, idx: findBlendshapeIndices(o) });
         }
       });
+    }
+
+    function fitCameraToObject(object: THREE.Object3D) {
+      const box = new THREE.Box3().setFromObject(object);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      const padding = 0.95;
+      const yFocusBias = 0.7;
+      const zoomFactor = 0.6;
+
+      const target = center.clone();
+      target.y += size.y * (yFocusBias - 0.5);
+
+      const fov = (camera.fov * Math.PI) / 180;
+      const height = size.y * padding;
+      const width = size.x * padding;
+      const distForHeight = height / (2 * Math.tan(fov / 2));
+      const distForWidth = width / (2 * Math.tan((fov * camera.aspect) / 2));
+      let distance = Math.max(distForHeight, distForWidth);
+      distance *= zoomFactor;
+
+      const dirv = new THREE.Vector3(0, 0.12, 1).normalize();
+      const newPos = target.clone().add(dirv.multiplyScalar(distance));
+
+      camera.position.copy(newPos);
+      camera.near = Math.max(0.01, distance / 100);
+      camera.far = distance * 100;
+      camera.updateProjectionMatrix();
+
+      controls.target.copy(target);
+      controls.update();
+
+      renderer.render(object.parent as THREE.Scene, camera);
     }
 
     loader.load(
@@ -178,54 +165,21 @@ export default function AvatarCanvas({ audioLevelRef }: Props) {
       (gltf) => {
         avatar = gltf.scene;
 
-        // Esconder mãos
-        avatar.traverse((o: any) => {
-          const n = (o.name || "").toLowerCase();
-          if (n.includes("hand") || n.includes("wrist") || n.includes("wolf3d_hands")) {
-            o.visible = false;
-          }
-          if (o.isMesh) {
-            o.castShadow = false;
-            o.receiveShadow = false;
-            if (o.material?.isMeshStandardMaterial) {
-              o.material.roughness = 0.75;
-              o.material.metalness = 0.05;
-            }
-          }
-        });
-
-        // Normalizar altura
+        // normalizar altura ~1.75 m
         const tmpBox = new THREE.Box3().setFromObject(avatar);
         const tmpSize = new THREE.Vector3();
         tmpBox.getSize(tmpSize);
-        const heightM = tmpSize.y || 1;
         const desired = 1.75;
-        avatar.scale.setScalar(desired / heightM);
+        const s = desired / (tmpSize.y || 1);
+        avatar.scale.setScalar(s);
+
         scene.add(avatar);
 
-        // Enquadrar
-        fitCameraToObject(camera, avatar, controls, renderer, {
-          padding: 0.95,
-          yFocusBias: 0.7,
-          zoomFactor: 0.6,
-        });
+        collectMorphMeshes(avatar);
+        fitCameraToObject(avatar);
 
-        // Animações (se houver idle)
-        if (gltf.animations && gltf.animations.length > 0) {
-          mixer = new THREE.AnimationMixer(avatar);
-          const action = mixer.clipAction(gltf.animations[0]);
-          action.play();
-        }
-
-        // recolher rig de boca
-        collectLipTargets(avatar);
-        // feedback no console para sabermos o que apanhou
-        // console.log("LipRig:", {
-        //   openPrimary: lipRig.openPrimary?.name,
-        //   openSecondary: lipRig.openSecondary?.name,
-        //   mouthClose: lipRig.mouthClose?.name,
-        //   jawBone: lipRig.jawBone?.name,
-        // });
+        // tentar ligar ao áudio do TTS se existir
+        attachAnalyserToAudio();
       },
       undefined,
       (err) => console.error("Falha a carregar GLB:", err)
@@ -238,56 +192,56 @@ export default function AvatarCanvas({ audioLevelRef }: Props) {
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-      if (avatar) {
-        fitCameraToObject(camera, avatar, controls, renderer, {
-          padding: 0.95,
-          yFocusBias: 0.7,
-          zoomFactor: 0.6,
-        });
-      }
+      if (avatar) fitCameraToObject(avatar);
     };
     const ro = new ResizeObserver(onResize);
     ro.observe(el);
 
     // Loop
     let raf = 0;
+    // smoothing simples para boca
+    let smooth = 0;
+
+    const tmpBuf = new Uint8Array(512);
+
     const tick = () => {
-      const dt = clock.getDelta();
-      if (mixer) mixer.update(dt);
-
-      // ---- LIPSYNC ----
-      // alvo atual (0..1) vindo do nível de áudio
-      const inLvl = Math.max(0, Math.min(1, audioLevelRef?.current ?? 0));
-
-      // curva: mais abertura com pouco som (gamma < 1), e ganho extra
-      const gamma = 0.7;
-      const gain = 1.8;
-      const targetOpen = Math.max(0, Math.min(1, Math.pow(inLvl, gamma) * gain));
-
-      // smoothing (ataque rápido, *release* mais lento para não “trémulo”)
-      const attack = 0.35;  // quanto maior, mais responde rápido a abrir
-      const release = 0.12; // quanto maior, mais rápido a fechar
-      const k = targetOpen > smoothOpen ? attack : release;
-      smoothOpen = smoothOpen + (targetOpen - smoothOpen) * k;
-
-      // limiar para não “mexer só os lábios”
-      const open = smoothOpen < 0.06 ? 0 : smoothOpen;
-
-      // aplicar a morph targets, se existirem
-      if (lipRig.openPrimary && lipRig.openPrimary.mesh.morphTargetInfluences) {
-        lipRig.openPrimary.mesh.morphTargetInfluences[lipRig.openPrimary.index] = open;
-      }
-      if (lipRig.openSecondary && lipRig.openSecondary.mesh.morphTargetInfluences) {
-        lipRig.openSecondary.mesh.morphTargetInfluences[lipRig.openSecondary.index] = open * 0.5;
-      }
-      if (lipRig.mouthClose && lipRig.mouthClose.mesh.morphTargetInfluences) {
-        // fechar ao inverso
-        lipRig.mouthClose.mesh.morphTargetInfluences[lipRig.mouthClose.index] = 1 - open;
+      // medir nível (prioridade: audioLevelRef; fallback: analyser interno)
+      let lvl = 0;
+      if (audioLevelRef && typeof audioLevelRef.current === "number") {
+        lvl = Math.max(0, Math.min(1, audioLevelRef.current));
+      } else if (analyserRef.current) {
+        const an = analyserRef.current;
+        const len = Math.min(tmpBuf.length, an.frequencyBinCount);
+        an.getByteFrequencyData(tmpBuf);
+        // média simples das baixas frequências (fala ~ < 1kHz)
+        let sum = 0;
+        const take = Math.max(8, Math.floor(len * 0.25));
+        for (let i = 0; i < take; i++) sum += tmpBuf[i];
+        lvl = (sum / (take * 255)) || 0;
+      } else {
+        // tentar ligar novamente (caso áudio só exista depois)
+        attachAnalyserToAudio();
       }
 
-      // fallback: rodar mandíbula se não houver morphs
-      if (!lipRig.openPrimary && !lipRig.openSecondary && lipRig.jawBone) {
-        lipRig.jawBone.rotation.x = open * 0.35; // ~20°
+      // suavizar
+      const attack = 0.5; // mais responsivo a subir
+      const release = 0.15; // cai devagar
+      if (lvl > smooth) smooth = smooth * (1 - attack) + lvl * attack;
+      else smooth = smooth * (1 - release) + lvl * release;
+
+      // aplicar blendshapes
+      if (morphMeshes.length) {
+        const mouthOpen = Math.min(1, smooth * 1.3); // ganho
+        const smile = Math.max(0, (smooth - 0.2) * 0.6);
+
+        for (const { mesh, idx } of morphMeshes) {
+          const infl = mesh.morphTargetInfluences!;
+          if (idx.jawOpen !== -1) infl[idx.jawOpen] = mouthOpen;
+          if (idx.viseme_aa !== -1) infl[idx.viseme_aa] = mouthOpen * 0.8;
+          if (idx.viseme_A !== -1) infl[idx.viseme_A] = mouthOpen * 0.6;
+          if (idx.mouthSmile !== -1) infl[idx.mouthSmile] = smile;
+          if (idx.mouthFrown !== -1) infl[idx.mouthFrown] = 0;
+        }
       }
 
       controls.update();
@@ -300,6 +254,9 @@ export default function AvatarCanvas({ audioLevelRef }: Props) {
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
+      try { srcNodeRef.current?.disconnect(); } catch {}
+      try { analyserRef.current?.disconnect?.(); } catch {}
+      try { audioCtxRef.current?.close?.(); } catch {}
       el.removeChild(renderer.domElement);
       renderer.dispose();
       scene.traverse((obj: any) => {
@@ -310,7 +267,8 @@ export default function AvatarCanvas({ audioLevelRef }: Props) {
         }
       });
     };
-  }, [audioLevelRef]);
+  }, [audioLevelRef, audioElementId]);
 
-  return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
+  // Altura generosa para aparecer bem centrado
+  return <div ref={containerRef} style={{ width: "100%", height: "540px" }} />;
 }
