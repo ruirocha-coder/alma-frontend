@@ -24,8 +24,57 @@ export default function Page() {
   // TTS player
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // cria <audio> e deixa visível no DOM (controls escondidos), ajuda iOS
+  // LIPSYNC: nível de áudio para o Avatar
+  const audioLevelRef = useRef<number>(0);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const meterRAF = useRef<number | null>(null);
+
+  function startOutputMeter() {
+    // já existe?
+    if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
+    const el = ttsAudioRef.current;
+    if (!el) return;
+
+    const AC = (window.AudioContext || (window as any).webkitAudioContext);
+    if (!AC) return;
+
+    const ctx = audioCtxRef.current || new AC();
+    audioCtxRef.current = ctx;
+
+    // MediaElementAudioSource permite medir o áudio do <audio>
+    const src = ctx.createMediaElementSource(el);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.7;
+
+    // liga cadeia
+    src.connect(analyser);
+    analyser.connect(ctx.destination); // para continuar a tocar
+
+    analyserRef.current = analyser;
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      analyser.getByteTimeDomainData(data);
+      // RMS simples
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128; // -1..1
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length); // 0..~0.7
+      // mapear para 0..1, com leve ganho
+      const level = Math.min(1, rms * 4);
+      audioLevelRef.current = level;
+      meterRAF.current = requestAnimationFrame(tick);
+    };
+    if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
+    meterRAF.current = requestAnimationFrame(tick);
+  }
+
   useEffect(() => {
+    // cria <audio> no DOM
     const el = document.getElementById("tts-audio") as HTMLAudioElement | null;
     if (el) {
       ttsAudioRef.current = el;
@@ -36,19 +85,22 @@ export default function Page() {
     }
 
     // desbloqueio no primeiro toque
-    const unlock = () => {
+    const unlock = async () => {
       const a = ttsAudioRef.current;
       if (!a) return;
       try {
         a.muted = true;
-        a
-          .play()
-          .then(() => {
-            a.pause();
-            a.currentTime = 0;
-            a.muted = false;
-          })
-          .catch(() => {});
+        await a.play().catch(() => {});
+        a.pause();
+        a.currentTime = 0;
+        a.muted = false;
+      } catch {}
+      // LIPSYNC: precisamos de contexto áudio “desbloqueado”
+      try {
+        const AC = (window.AudioContext || (window as any).webkitAudioContext);
+        if (AC && !audioCtxRef.current) {
+          audioCtxRef.current = new AC();
+        }
       } catch {}
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
@@ -59,6 +111,8 @@ export default function Page() {
     return () => {
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
+      if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
+      try { audioCtxRef.current?.close(); } catch {}
     };
   }, []);
 
@@ -96,7 +150,7 @@ export default function Page() {
           ? "audio/webm;codecs=opus"
           : MediaRecorder.isTypeSupported("audio/webm")
           ? "audio/webm"
-          : "audio/mp4"; // fallback Safari
+          : "audio/mp4";
 
       const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
       mediaRecorderRef.current = mr;
@@ -126,7 +180,6 @@ export default function Page() {
 
   async function handleTranscribeAndAnswer(blob: Blob) {
     try {
-      // 1) STT
       setStatus("🎧 A transcrever…");
       const fd = new FormData();
       fd.append("audio", blob, "audio.webm");
@@ -148,7 +201,6 @@ export default function Page() {
         return;
       }
 
-      // 2) ALMA
       await askAlma(said);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
@@ -177,13 +229,14 @@ export default function Page() {
         setStatus("⚠️ Áudio não inicializado.");
         return;
       }
-
-      // Carregar e tocar com user-gesture recente
       audio.src = url;
+
+      // LIPSYNC: garantir medição do áudio de saída
+      startOutputMeter();
+
       try {
         await audio.play();
       } catch {
-        // fallback: força play após um tap explícito no ecrã
         setStatus("⚠️ O navegador bloqueou o áudio. Toca no ecrã e tenta de novo.");
       }
     } catch (e: any) {
@@ -255,7 +308,7 @@ export default function Page() {
     }
   }
 
-  // Touch handlers para iOS (segurar)
+  // Touch handlers (hold)
   function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     startHold();
@@ -298,7 +351,8 @@ export default function Page() {
           background: "#0b0b0b",
         }}
       >
-        <AvatarCanvas />
+        {/* passa o nível de áudio para o avatar */}
+        <AvatarCanvas audioLevelRef={audioLevelRef} />
       </div>
 
       {/* player TTS no DOM (hidden-ish) */}
@@ -322,14 +376,14 @@ export default function Page() {
         </button>
 
         <button
-            onClick={testVoice}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 8,
-              border: "1px solid #444",
-              background: "#333",
-              color: "#fff",
-            }}
+          onClick={testVoice}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 8,
+            border: "1px solid #444",
+            background: "#333",
+            color: "#fff",
+          }}
         >
           Testar voz
         </button>
