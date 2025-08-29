@@ -5,10 +5,15 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
+type Props = {
+  /** Valor 0..1 opcional vindo do Page para abrir/fechar a boca (tem prioridade). */
+  audioLevelRef?: React.RefObject<number>;
+};
+
 const AVATAR_URL =
   process.env.NEXT_PUBLIC_RPM_GLTF_URL ||
   process.env.NEXT_PUBLIC_RPM_AVATAR_URL ||
-  // TIP: acrescenta ?morphTargets=ARKit no teu URL real
+  // Recomendo exportar com ARKit: …glb?morphTargets=ARKit
   "https://models.readyplayer.me/68ac391e858e75812baf48c2.glb?morphTargets=ARKit";
 
 type MeshWithMorph = THREE.Mesh & {
@@ -41,8 +46,7 @@ function fitCameraToObject(
   const width = size.x * padding;
   const distForHeight = height / (2 * Math.tan(fov / 2));
   const distForWidth = width / (2 * Math.tan((fov * camera.aspect) / 2));
-  let distance = Math.max(distForHeight, distForWidth);
-  distance *= zoomFactor;
+  let distance = Math.max(distForHeight, distForWidth) * zoomFactor;
 
   const dir = new THREE.Vector3(0, 0.12, 1).normalize();
   const newPos = target.clone().add(dir.multiplyScalar(distance));
@@ -58,7 +62,7 @@ function fitCameraToObject(
   renderer.render(object.parent as THREE.Scene, camera);
 }
 
-export default function AvatarCanvas() {
+export default function AvatarCanvas({ audioLevelRef }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -96,13 +100,13 @@ export default function AvatarCanvas() {
     controls.minDistance = 0.6;
     controls.maxDistance = 4.0;
 
-    // Audio Analyser (para lipsync por amplitude)
+    // Audio analyser (fallback interno)
     let audioCtx: AudioContext | null = null;
     let analyser: AnalyserNode | null = null;
     let dataArray: Uint8Array | null = null;
     let mediaElSource: MediaElementAudioSourceNode | null = null;
 
-    // Meshes/bones para lipsync
+    // Morph targets/bones
     const candidateMorphNames = [
       "jawOpen",
       "mouthOpen",
@@ -115,12 +119,10 @@ export default function AvatarCanvas() {
 
     let mouthMeshes: MeshWithMorph[] = [];
     let mouthMorphIndices: number[] = [];
-
-    // fallback se não houver morphs: tenta rodar mandíbula
     let jawBone: THREE.Bone | null = null;
-    const jawBoneCandidates = ["jaw", "Jaw", "JawBone", "mixamorig:Head", "Head"]; // heurístico
+    const jawBoneCandidates = ["jaw", "Jaw", "JawBone", "mixamorig:Head", "Head"];
 
-    // Carregar GLB
+    // Load GLB
     const loader = new GLTFLoader();
     let avatar: THREE.Group | null = null;
 
@@ -129,7 +131,7 @@ export default function AvatarCanvas() {
       (gltf) => {
         avatar = gltf.scene;
 
-        // Esconder mãos
+        // Hide hands & tweak materials
         avatar.traverse((o: any) => {
           const n = (o.name || "").toLowerCase();
           if (n.includes("hand") || n.includes("wrist") || n.includes("wolf3d_hands")) {
@@ -145,7 +147,7 @@ export default function AvatarCanvas() {
           }
         });
 
-        // Normalizar escala
+        // Normalize scale ~1.75m
         const tmpBox = new THREE.Box3().setFromObject(avatar);
         const tmpSize = new THREE.Vector3();
         tmpBox.getSize(tmpSize);
@@ -155,25 +157,24 @@ export default function AvatarCanvas() {
 
         scene.add(avatar);
 
-        // Procurar morphs de boca
+        // Find mouth morphs
         mouthMeshes = [];
         mouthMorphIndices = [];
         avatar.traverse((obj: any) => {
           const mesh = obj as MeshWithMorph;
           if (mesh.isMesh && mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
-            // tenta encontrar o primeiro morph que bata com os nomes candidatos
             for (const name of candidateMorphNames) {
               const idx = mesh.morphTargetDictionary[name];
               if (typeof idx === "number") {
                 mouthMeshes.push(mesh);
                 mouthMorphIndices.push(idx);
-                break; // usa o primeiro que existir neste mesh
+                break;
               }
             }
           }
         });
 
-        // se não houver morphs, tenta encontrar um osso de mandíbula para pequeno movimento
+        // Bone fallback
         if (mouthMeshes.length === 0) {
           avatar.traverse((obj: any) => {
             if (obj.isBone) {
@@ -185,15 +186,17 @@ export default function AvatarCanvas() {
           });
         }
 
-        // Enquadrar
+        // Frame
         fitCameraToObject(camera, avatar, controls, renderer, {
           padding: 0.95,
           yFocusBias: 0.72,
           zoomFactor: 0.58,
         });
 
-        // Ligar ao áudio do TTS
-        connectToTTSAudio();
+        // Link to <audio id="alma-tts"> only if não vier nível externo
+        if (!audioLevelRef) {
+          connectToTTSAudio();
+        }
       },
       undefined,
       (err) => console.error("Falha a carregar GLB:", err)
@@ -202,11 +205,9 @@ export default function AvatarCanvas() {
     function connectToTTSAudio() {
       const elAudio = document.getElementById("alma-tts") as HTMLAudioElement | null;
       if (!elAudio) {
-        // tenta mais tarde (quando o Page criar o <audio>)
         setTimeout(connectToTTSAudio, 400);
         return;
       }
-
       try {
         audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
         analyser = audioCtx.createAnalyser();
@@ -218,7 +219,7 @@ export default function AvatarCanvas() {
 
         mediaElSource = audioCtx.createMediaElementSource(elAudio);
         mediaElSource.connect(analyser);
-        analyser.connect(audioCtx.destination); // opcional (para “ouvir” via contexto)
+        // não precisamos enviar o áudio para o destination (já toca pelo elemento <audio>)
       } catch (e) {
         console.warn("Não consegui ligar Analyser ao audio do TTS:", e);
       }
@@ -231,7 +232,6 @@ export default function AvatarCanvas() {
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
-
       if (avatar) {
         fitCameraToObject(camera, avatar, controls, renderer, {
           padding: 0.95,
@@ -248,31 +248,32 @@ export default function AvatarCanvas() {
     const tick = () => {
       controls.update();
 
-      // Lipsync simples por amplitude
-      if (analyser && dataArray) {
+      // Escolhe fonte de “abertura de boca”:
+      // 1) se vier de audioLevelRef (Page), usa esse valor 0..1
+      // 2) senão, calcula do analyser (rms)
+      let open = 0;
+
+      if (audioLevelRef && typeof audioLevelRef.current === "number") {
+        open = Math.min(1, Math.max(0, audioLevelRef.current!));
+      } else if (analyser && dataArray) {
         analyser.getByteTimeDomainData(dataArray);
-        // RMS rápido
         let sum = 0;
         for (let i = 0; i < dataArray.length; i++) {
-          const v = (dataArray[i] - 128) / 128; // [-1..1]
+          const v = (dataArray[i] - 128) / 128;
           sum += v * v;
         }
         const rms = Math.sqrt(sum / dataArray.length); // 0..~1
-        // normalizar e comprimir um bocado
-        let open = Math.min(1, Math.max(0, (rms - 0.02) * 8));
+        open = Math.min(1, Math.max(0, (rms - 0.02) * 8));
+      }
 
-        if (mouthMeshes.length && mouthMorphIndices.length) {
-          for (let i = 0; i < mouthMeshes.length; i++) {
-            const m = mouthMeshes[i];
-            const idx = mouthMorphIndices[i];
-            if (m.morphTargetInfluences) {
-              m.morphTargetInfluences[idx] = open;
-            }
-          }
-        } else if (jawBone) {
-          // fallback: roda ligeiramente a mandíbula
-          jawBone.rotation.x = -open * 0.25; // ~14º
+      if (mouthMeshes.length && mouthMorphIndices.length) {
+        for (let i = 0; i < mouthMeshes.length; i++) {
+          const m = mouthMeshes[i];
+          const idx = mouthMorphIndices[i];
+          if (m.morphTargetInfluences) m.morphTargetInfluences[idx] = open;
         }
+      } else if (jawBone) {
+        jawBone.rotation.x = -open * 0.25;
       }
 
       renderer.render(scene, camera);
@@ -299,8 +300,7 @@ export default function AvatarCanvas() {
         }
       });
     };
-  }, []);
+  }, [audioLevelRef]);
 
-  // Ocupa toda a altura disponível do “slot” do container no Page
   return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
 }
