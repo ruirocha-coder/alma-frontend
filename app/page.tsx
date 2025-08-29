@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import AvatarCanvas from "@/components/AvatarCanvas";
+
+import AvatarCanvas from "../components/AvatarCanvas";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
