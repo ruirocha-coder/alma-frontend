@@ -7,7 +7,7 @@ export const maxDuration = 60; // dá folga no edge/serverless
 
 export async function POST(req: NextRequest) {
   try {
-    const { question } = await req.json();
+    const { question, user_id } = await req.json();
 
     const ALMA_URL =
       process.env.NEXT_PUBLIC_ALMA_SERVER_URL || process.env.ALMA_SERVER_URL;
@@ -27,14 +27,17 @@ export async function POST(req: NextRequest) {
     try {
       r = await fetch(ALMA_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        headers: {
+          "Content-Type": "application/json",
+          // passa o user_id para o Alma Server (Mem0 usa este identificador)
+          "x-user-id": user_id || "",
+        },
+        // mantém a mesma forma de enviar, só acrescenta o user_id
+        body: JSON.stringify({ question, user_id }),
         signal: controller.signal,
         cache: "no-store",
       });
     } catch (err: any) {
-      // Quando o fetch é abortado ou o socket cai, o browser teria "Failed to fetch".
-      // Aqui devolvemos 504 com mensagem clara para o cliente mostrar.
       clearTimeout(to);
       return NextResponse.json(
         { answer: "⚠️ Timeout ao contactar o Alma Server (28s). Tenta novamente." },
