@@ -16,6 +16,27 @@ export default function Page() {
 
   const [log, setLog] = useState<LogItem[]>([]);
 
+  // --- user_id persistente (para Mem0)
+  const [userId, setUserId] = useState<string>("");
+
+  useEffect(() => {
+    try {
+      let uid = localStorage.getItem("alma_user_id");
+      if (!uid) {
+        // usa crypto.randomUUID se existir (moderno), senão fallback
+        const gen =
+          (typeof crypto !== "undefined" && (crypto as any).randomUUID?.()) ||
+          (`u_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`);
+        uid = gen;
+        localStorage.setItem("alma_user_id", uid);
+      }
+      setUserId(uid);
+    } catch {
+      // se der erro (privacy mode), usa um id volátil
+      setUserId(`u_${Date.now().toString(36)}`);
+    }
+  }, []);
+
   // --- Audio / Recorder
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -75,7 +96,7 @@ export default function Page() {
 
   useEffect(() => {
     // cria <audio> no DOM
-    const el = document.getElementById("tts-audio") as HTMLAudioElement | null;
+    const el = document.getElementById("alma-tts") as HTMLAudioElement | null;
     if (el) {
       ttsAudioRef.current = el;
       (el as any).playsInline = true;
@@ -257,7 +278,10 @@ export default function Page() {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({
+          question,
+          user_id: userId || "anon", // 👈 passa sempre o user_id
+        }),
       });
       if (!almaResp.ok) {
         const txt = await almaResp.text();
@@ -289,7 +313,10 @@ export default function Page() {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q }),
+        body: JSON.stringify({
+          question: q,
+          user_id: userId || "anon", // 👈 idem
+        }),
       });
       if (!almaResp.ok) {
         const txt = await almaResp.text();
@@ -356,7 +383,7 @@ export default function Page() {
       </div>
 
       {/* player TTS no DOM (hidden-ish) */}
-      <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
+      <audio id="alma-tts" style={{ width: 0, height: 0, opacity: 0 }} />
 
       <p style={{ opacity: 0.8, marginBottom: 16 }}>{status}</p>
 
