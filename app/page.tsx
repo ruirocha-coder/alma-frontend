@@ -5,6 +5,21 @@ import AvatarCanvas from "../components/AvatarCanvas";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
+// --- USER_ID estável para Mem0 (curto prazo)
+function getUserId() {
+  try {
+    const KEY = "alma_user_id";
+    let v = localStorage.getItem(KEY);
+    if (v) return v;
+    v = "u_" + crypto.getRandomValues(new Uint32Array(1))[0].toString(16);
+    localStorage.setItem(KEY, v);
+    return v;
+  } catch {
+    return "anon";
+  }
+}
+const USER_ID = typeof window !== "undefined" ? getUserId() : "anon";
+
 export default function Page() {
   // --- UI state
   const [status, setStatus] = useState<string>("Pronto");
@@ -15,27 +30,6 @@ export default function Page() {
   const [typed, setTyped] = useState("");
 
   const [log, setLog] = useState<LogItem[]>([]);
-
-  // --- user_id persistente (para Mem0)
-  const [userId, setUserId] = useState<string>("");
-
-  useEffect(() => {
-    try {
-      let uid = localStorage.getItem("alma_user_id");
-      if (!uid) {
-        // usa crypto.randomUUID se existir (moderno), senão fallback
-        const gen =
-          (typeof crypto !== "undefined" && (crypto as any).randomUUID?.()) ||
-          (`u_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`);
-        uid = gen;
-        localStorage.setItem("alma_user_id", uid);
-      }
-      setUserId(uid);
-    } catch {
-      // se der erro (privacy mode), usa um id volátil
-      setUserId(`u_${Date.now().toString(36)}`);
-    }
-  }, []);
 
   // --- Audio / Recorder
   const streamRef = useRef<MediaStream | null>(null);
@@ -96,7 +90,7 @@ export default function Page() {
 
   useEffect(() => {
     // cria <audio> no DOM
-    const el = document.getElementById("alma-tts") as HTMLAudioElement | null;
+    const el = document.getElementById("tts-audio") as HTMLAudioElement | null;
     if (el) {
       ttsAudioRef.current = el;
       (el as any).playsInline = true;
@@ -278,10 +272,8 @@ export default function Page() {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question,
-          user_id: userId || "anon", // 👈 passa sempre o user_id
-        }),
+        // >>> PASSA user_id para o alma-server (Mem0)
+        body: JSON.stringify({ question, user_id: USER_ID }),
       });
       if (!almaResp.ok) {
         const txt = await almaResp.text();
@@ -313,10 +305,8 @@ export default function Page() {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: q,
-          user_id: userId || "anon", // 👈 idem
-        }),
+        // >>> PASSA user_id para o alma-server (Mem0)
+        body: JSON.stringify({ question: q, user_id: USER_ID }),
       });
       if (!almaResp.ok) {
         const txt = await almaResp.text();
@@ -383,7 +373,7 @@ export default function Page() {
       </div>
 
       {/* player TTS no DOM (hidden-ish) */}
-      <audio id="alma-tts" style={{ width: 0, height: 0, opacity: 0 }} />
+      <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
 
       <p style={{ opacity: 0.8, marginBottom: 16 }}>{status}</p>
 
