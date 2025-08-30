@@ -3,11 +3,17 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60; // dá folga no edge/serverless
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
-    const { question, user_id } = await req.json();
+    const { question, user_id: clientUserId } = await req.json();
+
+    // user_id vem do body ou de header opcional (fallback)
+    const user_id =
+      clientUserId ||
+      req.headers.get("x-user-id") ||
+      "anon";
 
     const ALMA_URL =
       process.env.NEXT_PUBLIC_ALMA_SERVER_URL || process.env.ALMA_SERVER_URL;
@@ -19,7 +25,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Timeout “antes” do corte da plataforma (Railway ~30s)
     const controller = new AbortController();
     const to = setTimeout(() => controller.abort(), 28_000);
 
@@ -27,17 +32,12 @@ export async function POST(req: NextRequest) {
     try {
       r = await fetch(ALMA_URL, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          // passa o user_id para o Alma Server (Mem0 usa este identificador)
-          "x-user-id": user_id || "",
-        },
-        // mantém a mesma forma de enviar, só acrescenta o user_id
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question, user_id }),
         signal: controller.signal,
         cache: "no-store",
       });
-    } catch (err: any) {
+    } catch {
       clearTimeout(to);
       return NextResponse.json(
         { answer: "⚠️ Timeout ao contactar o Alma Server (28s). Tenta novamente." },
