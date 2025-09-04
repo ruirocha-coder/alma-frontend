@@ -21,7 +21,42 @@ function getUserId() {
 const USER_ID = typeof window !== "undefined" ? getUserId() : "anon";
 
 export default function Page() {
-  // --- UI state
+  // ---------- PALETA (igual à do alma-chat)
+  const colors = {
+    bg: "#0a0a0b",
+    panel: "#0f0f11",
+    panel2: "#141418",
+    fg: "#f3f3f3",
+    fgDim: "#cfcfd3",
+    border: "#26262b",
+    accent: "#d4a017", // amarelo torrado
+    bubbleUser: "#1b1b21",
+    bubbleAlma: "#23232a",
+  };
+
+  // helpers visuais (apenas estilo)
+  const btnBase: React.CSSProperties = {
+    padding: "10px 14px",
+    borderRadius: 10,
+    border: `1px solid ${colors.border}`,
+    background: "#19191e",
+    color: colors.fg,
+    cursor: "pointer",
+  };
+  const btnSubtle: React.CSSProperties = {
+    ...btnBase,
+    background: "#14141a",
+    color: colors.fgDim,
+  };
+  const btnPrimary: React.CSSProperties = {
+    ...btnBase,
+    background: colors.accent,
+    color: "#000",
+    borderColor: "rgba(0,0,0,0.35)",
+    fontWeight: 600,
+  };
+
+  // --- UI state (inalterado)
   const [status, setStatus] = useState<string>("Pronto");
   const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -31,7 +66,7 @@ export default function Page() {
 
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // --- Audio / Recorder
+  // --- Audio / Recorder (inalterado)
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -39,47 +74,42 @@ export default function Page() {
   // TTS player
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
-  // LIPSYNC: nível de áudio para o Avatar
+  // LIPSYNC
   const audioLevelRef = useRef<number>(0);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const meterRAF = useRef<number | null>(null);
 
   function startOutputMeter() {
-    // já existe?
     if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
     const el = ttsAudioRef.current;
     if (!el) return;
 
-    const AC = (window.AudioContext || (window as any).webkitAudioContext);
+    const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
     if (!AC) return;
 
     const ctx = audioCtxRef.current || new AC();
     audioCtxRef.current = ctx;
 
-    // MediaElementAudioSource permite medir o áudio do <audio>
     const src = ctx.createMediaElementSource(el);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0.7;
 
-    // liga cadeia
     src.connect(analyser);
-    analyser.connect(ctx.destination); // para continuar a tocar
+    analyser.connect(ctx.destination);
 
     analyserRef.current = analyser;
 
     const data = new Uint8Array(analyser.frequencyBinCount);
     const tick = () => {
       analyser.getByteTimeDomainData(data);
-      // RMS simples
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
-        const v = (data[i] - 128) / 128; // -1..1
+        const v = (data[i] - 128) / 128;
         sum += v * v;
       }
-      const rms = Math.sqrt(sum / data.length); // 0..~0.7
-      // mapear para 0..1, com leve ganho
+      const rms = Math.sqrt(sum / data.length);
       const level = Math.min(1, rms * 4);
       audioLevelRef.current = level;
       meterRAF.current = requestAnimationFrame(tick);
@@ -89,7 +119,6 @@ export default function Page() {
   }
 
   useEffect(() => {
-    // cria <audio> no DOM
     const el = document.getElementById("tts-audio") as HTMLAudioElement | null;
     if (el) {
       ttsAudioRef.current = el;
@@ -99,7 +128,6 @@ export default function Page() {
       el.crossOrigin = "anonymous";
     }
 
-    // desbloqueio no primeiro toque
     const unlock = async () => {
       const a = ttsAudioRef.current;
       if (!a) return;
@@ -110,12 +138,9 @@ export default function Page() {
         a.currentTime = 0;
         a.muted = false;
       } catch {}
-      // LIPSYNC: precisamos de contexto áudio “desbloqueado”
       try {
-        const AC = (window.AudioContext || (window as any).webkitAudioContext);
-        if (AC && !audioCtxRef.current) {
-          audioCtxRef.current = new AC();
-        }
+        const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
+        if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
       } catch {}
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
@@ -127,11 +152,13 @@ export default function Page() {
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
       if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
-      try { audioCtxRef.current?.close(); } catch {}
+      try {
+        audioCtxRef.current?.close();
+      } catch {}
     };
   }, []);
 
-  // --- Microfone
+  // --- Micro (inalterado)
   async function requestMic() {
     try {
       setStatus("A pedir permissão do micro…");
@@ -246,7 +273,6 @@ export default function Page() {
       }
       audio.src = url;
 
-      // LIPSYNC: garantir medição do áudio de saída
       startOutputMeter();
 
       try {
@@ -272,7 +298,6 @@ export default function Page() {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // >>> PASSA user_id para o alma-server (Mem0)
         body: JSON.stringify({ question, user_id: USER_ID }),
       });
       if (!almaResp.ok) {
@@ -305,7 +330,6 @@ export default function Page() {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // >>> PASSA user_id para o alma-server (Mem0)
         body: JSON.stringify({ question: q, user_id: USER_ID }),
       });
       if (!almaResp.ok) {
@@ -343,16 +367,17 @@ export default function Page() {
     });
   }
 
+  // ---------- UI ----------
   return (
     <main
       style={{
-        maxWidth: 820,
+        maxWidth: 980,
         margin: "0 auto",
         padding: 16,
         fontFamily:
           '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"',
-        color: "#fff",
-        background: "#0b0b0b",
+        color: colors.fg,
+        background: colors.bg,
         minHeight: "100vh",
       }}
     >
@@ -362,46 +387,48 @@ export default function Page() {
           width: "100%",
           height: 520,
           marginBottom: 16,
-          border: "1px solid #333",
-          borderRadius: 12,
+          border: `1px solid ${colors.border}`,
+          borderRadius: 16,
           overflow: "hidden",
-          background: "#0b0b0b",
+          background: colors.panel,
+          boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
         }}
       >
-        {/* passa o nível de áudio para o avatar */}
         <AvatarCanvas audioLevelRef={audioLevelRef} />
       </div>
 
       {/* player TTS no DOM (hidden-ish) */}
       <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
 
-      <p style={{ opacity: 0.8, marginBottom: 16 }}>{status}</p>
+      {/* STATUS */}
+      <div
+        style={{
+          marginBottom: 16,
+          padding: "10px 12px",
+          border: `1px solid ${colors.border}`,
+          borderRadius: 10,
+          background: colors.panel2,
+          color: colors.fgDim,
+        }}
+      >
+        {status}
+      </div>
 
       {/* Controlo de micro */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
         <button
           onClick={requestMic}
           style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: isArmed ? "#113311" : "#222",
-            color: isArmed ? "#9BE29B" : "#fff",
+            ...btnBase,
+            background: isArmed ? "#133015" : "#19191e",
+            color: isArmed ? "#9BE29B" : colors.fg,
+            borderColor: isArmed ? "rgba(155,226,155,0.25)" : colors.border,
           }}
         >
           {isArmed ? "Micro pronto ✅" : "Ativar micro"}
         </button>
 
-        <button
-          onClick={testVoice}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: "#333",
-            color: "#fff",
-          }}
-        >
+        <button onClick={testVoice} style={btnSubtle}>
           Testar voz
         </button>
 
@@ -411,11 +438,10 @@ export default function Page() {
           onTouchStart={onHoldStart}
           onTouchEnd={onHoldEnd}
           style={{
-            padding: "10px 14px",
+            ...btnPrimary,
             borderRadius: 999,
-            border: "1px solid #444",
-            background: isRecording ? "#8b0000" : "#333",
-            color: "#fff",
+            background: isRecording ? "#8b0000" : colors.accent,
+            color: isRecording ? "#fff" : "#000",
           }}
         >
           {isRecording ? "A gravar… solta para enviar" : "🎤 Segurar para falar"}
@@ -429,93 +455,123 @@ export default function Page() {
               a.currentTime = 0;
             }
           }}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: "#222",
-            color: "#ddd",
-          }}
+          style={btnSubtle}
         >
           ⏹️ Interromper fala
         </button>
 
-        <button
-          onClick={copyLog}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: "#222",
-            color: "#ddd",
-          }}
-        >
+        <button onClick={copyLog} style={btnSubtle}>
           Copiar histórico
         </button>
       </div>
 
       {/* Entrada por texto */}
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          marginBottom: 18,
+          alignItems: "stretch",
+        }}
+      >
         <input
           value={typed}
           onChange={(e) => setTyped(e.target.value)}
           placeholder="Escreve aqui para perguntar à Alma…"
           style={{
             flex: 1,
-            padding: "10px 12px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: "#111",
-            color: "#fff",
+            padding: "14px 14px",
+            borderRadius: 12,
+            border: `1px solid ${colors.border}`,
+            background: "#101014",
+            color: colors.fg,
+            outline: "none",
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") sendTyped();
           }}
         />
-        <button
-          onClick={sendTyped}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 8,
-            border: "1px solid #444",
-            background: "#2b2bff",
-            color: "#fff",
-          }}
-        >
-          Enviar
-        </button>
+        <button onClick={sendTyped} style={{ ...btnPrimary, minWidth: 120 }}>Enviar</button>
       </div>
 
-      {/* Conversa simples */}
+      {/* Conversa — estilo tipo “bubbles” como no alma-chat */}
       <div
         style={{
-          border: "1px solid #333",
-          borderRadius: 12,
-          padding: 12,
-          background: "#0f0f0f",
+          border: `1px solid ${colors.border}`,
+          borderRadius: 14,
+          padding: 14,
+          background: colors.panel,
+          boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
         }}
       >
-        <div style={{ marginBottom: 8 }}>
-          <div style={{ fontWeight: 600, color: "#aaa" }}>Tu (último):</div>
-          <div style={{ whiteSpace: "pre-wrap" }}>{transcript || "—"}</div>
-        </div>
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontWeight: 600, color: "#aaa" }}>Alma (último):</div>
-          <div style={{ whiteSpace: "pre-wrap" }}>{answer || "—"}</div>
+        {/* Último turno (mantido) */}
+        <div
+          style={{
+            marginBottom: 12,
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 10,
+          }}
+        >
+          <div
+            style={{
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              padding: 10,
+              background: colors.panel2,
+            }}
+          >
+            <div style={{ fontWeight: 600, color: colors.fgDim, marginBottom: 6 }}>Tu (último):</div>
+            <div style={{ whiteSpace: "pre-wrap" }}>{transcript || "—"}</div>
+          </div>
+          <div
+            style={{
+              border: `1px solid ${colors.border}`,
+              borderRadius: 12,
+              padding: 10,
+              background: colors.panel2,
+            }}
+          >
+            <div style={{ fontWeight: 600, color: colors.fgDim, marginBottom: 6 }}>Alma (último):</div>
+            <div style={{ whiteSpace: "pre-wrap" }}>{answer || "—"}</div>
+          </div>
         </div>
 
-        <hr style={{ borderColor: "#222", margin: "8px 0 12px" }} />
-
+        {/* Histórico estilo balões */}
         <div>
-          <div style={{ fontWeight: 600, color: "#aaa", marginBottom: 6 }}>Histórico</div>
-          <div style={{ display: "grid", gap: 6 }}>
-            {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
-            {log.map((m, i) => (
-              <div key={i} style={{ whiteSpace: "pre-wrap" }}>
-                <span style={{ color: "#999" }}>{m.role === "you" ? "Tu:" : "Alma:"}</span>{" "}
-                {m.text}
-              </div>
-            ))}
+          <div style={{ fontWeight: 600, color: colors.fgDim, marginBottom: 10 }}>Histórico</div>
+          {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
+          <div style={{ display: "grid", gap: 10 }}>
+            {log.map((m, i) => {
+              const right = m.role === "alma";
+              return (
+                <div
+                  key={i}
+                  style={{
+                    display: "flex",
+                    justifyContent: right ? "flex-end" : "flex-start",
+                  }}
+                >
+                  <div
+                    style={{
+                      maxWidth: "720px",
+                      padding: "12px 14px",
+                      borderRadius: 14,
+                      border: `1px solid rgba(255,255,255,0.06)`,
+                      background: right ? colors.bubbleAlma : colors.bubbleUser,
+                      color: colors.fg,
+                      whiteSpace: "pre-wrap",
+                      boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
+                    }}
+                  >
+                    <div style={{ fontSize: 12, color: colors.fgDim, marginBottom: 6 }}>
+                      {m.role === "you" ? "Tu" : "Alma"}
+                    </div>
+                    {m.text}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
