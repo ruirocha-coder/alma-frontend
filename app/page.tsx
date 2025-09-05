@@ -34,22 +34,28 @@ export default function Page() {
     bubbleAlma: "#23232a",
   };
 
-  // helpers base
+  // helpers visuais (apenas estilo)
+  const btnBase: React.CSSProperties = {
+    padding: "10px 14px",
+    borderRadius: 10,
+    border: `1px solid ${colors.border}`,
+    background: "#19191e",
+    color: colors.fg,
+    cursor: "pointer",
+  };
   const btnPrimaryRound: React.CSSProperties = {
-    width: 80,
-    height: 80,
+    ...btnBase,
     borderRadius: 999,
-    border: "0",
+    width: 160,
+    height: 160,
+    fontSize: 16,
+    fontWeight: 700,
     background: colors.accent,
     color: "#000",
-    fontSize: 28,
-    fontWeight: 700,
-    cursor: "pointer",
+    borderColor: "rgba(0,0,0,0.35)",
     display: "grid",
     placeItems: "center",
-    boxShadow: "0 10px 28px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.25)",
-    userSelect: "none",
-    WebkitTapHighlightColor: "transparent",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
   };
 
   // --- UI state
@@ -58,6 +64,7 @@ export default function Page() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
+  const [typed, setTyped] = useState("");
 
   const [log, setLog] = useState<LogItem[]>([]);
 
@@ -65,7 +72,6 @@ export default function Page() {
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-  const isPressingRef = useRef(false);
 
   // TTS player
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -75,6 +81,9 @@ export default function Page() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const meterRAF = useRef<number | null>(null);
+
+  // “latch” para 1º toque
+  const firstArmDoneRef = useRef(false);
 
   function startOutputMeter() {
     if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
@@ -114,7 +123,25 @@ export default function Page() {
     meterRAF.current = requestAnimationFrame(tick);
   }
 
-  // desbloqueio de áudio iOS + ref do <audio>
+  // garante que o áudio está “unlocked” (iOS/Chrome mobile)
+  async function ensureAudioUnlocked() {
+    const a = ttsAudioRef.current;
+    if (!a) return;
+    try {
+      a.muted = true;
+      (a as any).playsInline = true;
+      a.autoplay = false;
+      a.preload = "auto";
+      await a.play().catch(() => {});
+      a.pause();
+      a.currentTime = 0;
+      a.muted = false;
+
+      const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
+      if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
+    } catch {}
+  }
+
   useEffect(() => {
     const el = document.getElementById("tts-audio") as HTMLAudioElement | null;
     if (el) {
@@ -124,31 +151,7 @@ export default function Page() {
       el.preload = "auto";
       el.crossOrigin = "anonymous";
     }
-
-    const unlock = async () => {
-      const a = ttsAudioRef.current;
-      try {
-        if (a) {
-          a.muted = true;
-          await a.play().catch(() => {});
-          a.pause();
-          a.currentTime = 0;
-          a.muted = false;
-        }
-      } catch {}
-      try {
-        const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
-        if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
-      } catch {}
-      document.removeEventListener("click", unlock);
-      document.removeEventListener("touchstart", unlock);
-    };
-    document.addEventListener("click", unlock, { once: true });
-    document.addEventListener("touchstart", unlock, { once: true });
-
     return () => {
-      document.removeEventListener("click", unlock);
-      document.removeEventListener("touchstart", unlock);
       if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
       try {
         audioCtxRef.current?.close();
@@ -158,13 +161,7 @@ export default function Page() {
 
   // --- Micro
   async function requestMic() {
-    const have = streamRef.current;
-    if (have) {
-      setIsArmed(true);
-      return have;
-    }
     try {
-      setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, noiseSuppression: true, echoCancellation: false },
         video: false,
@@ -172,15 +169,19 @@ export default function Page() {
       streamRef.current = stream;
       setIsArmed(true);
       setStatus("Micro pronto. Mantém o botão para falar.");
-      return stream;
     } catch {
       setStatus("⚠️ Permissão do micro negada. Ativa nas definições do navegador.");
-      return null;
     }
   }
 
-  async function startRecording() {
-    if (!streamRef.current) return;
+  function startHold() {
+    if (!isArmed) {
+      return;
+    }
+    if (!streamRef.current) {
+      setStatus("⚠️ Micro não está pronto. Toca no botão para ativar.");
+      return;
+    }
     try {
       setStatus("🎙️ A gravar…");
       chunksRef.current = [];
@@ -210,7 +211,7 @@ export default function Page() {
     }
   }
 
-  function stopRecording() {
+  function stopHold() {
     if (mediaRecorderRef.current && isRecording) {
       setStatus("⏳ A processar áudio…");
       mediaRecorderRef.current.stop();
@@ -309,7 +310,7 @@ export default function Page() {
     }
   }
 
-  async function sendTyped(typed: string, setTyped: (v: string) => void) {
+  async function sendTyped() {
     const q = typed.trim();
     if (!q) return;
     setStatus("🧠 A perguntar à Alma…");
@@ -341,44 +342,38 @@ export default function Page() {
     }
   }
 
-  // --- Botão Único: lógica de press/hold + interrupção TTS
-  function isSpeaking() {
+  // ---------- Botão único (pointer handlers)
+  async function handlePointerDown(e: React.PointerEvent) {
+    e.preventDefault();
+
+    // se a Alma estiver a falar, 1º toque interrompe
     const a = ttsAudioRef.current;
-    return !!a && !a.paused && !a.ended && a.currentTime > 0;
-  }
-
-  async function onPressDown() {
-    isPressingRef.current = true;
-
-    // desbloqueio áudio imediato
-    try {
-      const a = ttsAudioRef.current;
-      if (a) {
-        await a.play().catch(() => {});
-        a.pause();
-        a.currentTime = 0;
-      }
-    } catch {}
-
-    // se estiver a falar → interromper e NÃO começar a gravar neste toque
-    if (isSpeaking()) {
-      const a = ttsAudioRef.current!;
+    if (a && !a.paused) {
       a.pause();
       a.currentTime = 0;
-      setStatus("⏹️ Interrompido");
-      return;
+      setStatus("Pronto");
+      return; // este toque serviu para interromper
     }
 
-    // pedir micro (primeira vez) e, se ainda estiver a pressionar, arrancar gravação
-    const s = await requestMic();
-    if (s && isPressingRef.current) {
-      await startRecording();
+    // 1º toque: desbloqueia áudio + pede micro e sai
+    if (!isArmed) {
+      setStatus("A preparar áudio e micro…");
+      await ensureAudioUnlocked();
+      await requestMic();
+      firstArmDoneRef.current = true;
+      setStatus("Micro pronto. Mantém o botão para falar.");
+      return; // importante: não começa a gravar neste gesto
     }
+
+    // Já armado → iniciar gravação ao “segurar”
+    startHold();
   }
 
-  function onPressUp() {
-    isPressingRef.current = false;
-    stopRecording();
+  function handlePointerUp(e: React.PointerEvent) {
+    e.preventDefault();
+    if (isRecording) {
+      stopHold();
+    }
   }
 
   function copyLog() {
@@ -390,8 +385,6 @@ export default function Page() {
   }
 
   // ---------- UI ----------
-  const [typed, setTyped] = useState("");
-
   return (
     <main
       style={{
@@ -410,56 +403,55 @@ export default function Page() {
         style={{
           width: "100%",
           height: 520,
-          marginBottom: 12,
+          marginBottom: 16,
           border: `1px solid ${colors.border}`,
           borderRadius: 16,
           overflow: "hidden",
           background: colors.panel,
           boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
-          display: "grid",
-          placeItems: "stretch",
         }}
       >
         <AvatarCanvas audioLevelRef={audioLevelRef} />
       </div>
 
-      {/* player TTS no DOM (hidden) */}
+      {/* player TTS no DOM (hidden-ish) */}
       <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
 
       {/* STATUS — invisível (sem borda), texto centrado */}
       <div
         style={{
-          margin: "6px 0 8px 0",
-          padding: "6px 0",
+          marginBottom: 16,
+          padding: "10px 12px",
           border: "none",
-          background: colors.bg,
+          borderRadius: 10,
+          background: colors.bg, // igual ao fundo → invisível
           color: colors.fgDim,
           textAlign: "center",
-          minHeight: 22,
         }}
       >
         {status}
       </div>
 
-      {/* Botão ÚNICO — centrado */}
-      <div style={{ display: "flex", justifyContent: "center", marginBottom: 14 }}>
+      {/* Botão único, centrado */}
+      <div style={{ display: "grid", placeItems: "center", marginBottom: 18 }}>
         <button
-          aria-label={isRecording ? "A gravar… solta para enviar" : "Segurar para falar / tocar para interromper"}
-          onPointerDown={onPressDown}
-          onPointerUp={onPressUp}
-          onPointerCancel={onPressUp}
-          onContextMenu={(e) => e.preventDefault()}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onPointerLeave={handlePointerUp}
           style={{
             ...btnPrimaryRound,
             background: isRecording ? "#8b0000" : colors.accent,
             color: isRecording ? "#fff" : "#000",
+            touchAction: "none",
+            WebkitTapHighlightColor: "transparent",
           }}
         >
-          {isRecording ? "◉" : "🎤"}
+          {isArmed ? (isRecording ? "A gravar…\nsolta para enviar" : "Segurar para falar") : "Falar com a Alma"}
         </button>
       </div>
 
-      {/* Entrada por texto */}
+      {/* Entrada por texto (mantida) */}
       <div
         style={{
           display: "flex",
@@ -482,26 +474,26 @@ export default function Page() {
             outline: "none",
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter") sendTyped(typed, setTyped);
+            if (e.key === "Enter") sendTyped();
           }}
         />
         <button
-          onClick={() => sendTyped(typed, setTyped)}
+          onClick={sendTyped}
           style={{
-            width: 120,
-            borderRadius: 10,
-            border: "0",
+            ...btnBase,
             background: colors.accent,
             color: "#000",
+            borderColor: "rgba(0,0,0,0.35)",
             fontWeight: 600,
-            cursor: "pointer",
+            minWidth: 120,
+            borderRadius: 12,
           }}
         >
           Enviar
         </button>
       </div>
 
-      {/* Conversa — só “bubbles” + Copiar no canto inferior direito */}
+      {/* Conversa — painel único tipo “bubbles” (sem ‘Último’/‘Histórico’) */}
       <div
         style={{
           position: "relative",
@@ -510,30 +502,33 @@ export default function Page() {
           padding: 14,
           background: colors.panel,
           boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
+          minHeight: 120,
         }}
       >
-        {/* botão copiar no canto inferior direito */}
+        {/* Botão Copiar no canto inferior direito (estilo do alma-chat) */}
         <button
           onClick={copyLog}
           style={{
             position: "absolute",
             right: 12,
-            bottom: 10,
+            bottom: 12,
             fontSize: 12,
             color: colors.fgDim,
             background: "transparent",
             border: "none",
             cursor: "pointer",
-            padding: 4,
+            padding: 6,
           }}
-          title="Copiar"
+          title="Copiar histórico"
         >
           Copiar
         </button>
 
-        {/* Histórico */}
-        {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
+        {/* Bubbles */}
         <div style={{ display: "grid", gap: 10 }}>
+          {log.length === 0 && (
+            <div style={{ opacity: 0.6, color: colors.fgDim }}>Sem mensagens ainda.</div>
+          )}
           {log.map((m, i) => {
             const right = m.role === "alma";
             return (
