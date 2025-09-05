@@ -43,6 +43,11 @@ export default function Page() {
     color: colors.fg,
     cursor: "pointer",
   };
+  const btnSubtle: React.CSSProperties = {
+    ...btnBase,
+    background: "#14141a",
+    color: colors.fgDim,
+  };
   const btnPrimary: React.CSSProperties = {
     ...btnBase,
     background: colors.accent,
@@ -57,16 +62,8 @@ export default function Page() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
-  const [typed, setTyped] = useState("");
 
   const [log, setLog] = useState<LogItem[]>([]);
-
-  // NOVO: estado p/ botão único
-  const [firstPressDone, setFirstPressDone] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const pressTimerRef = useRef<number | null>(null);
-  const holdingRef = useRef(false);
-  const HOLD_DELAY_MS = 250;
 
   // --- Audio / Recorder
   const streamRef = useRef<MediaStream | null>(null);
@@ -81,6 +78,77 @@ export default function Page() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const meterRAF = useRef<number | null>(null);
+  const audioPrimedRef = useRef<boolean>(false); // <- para evitar duplo toque
+
+  // ---------- PRIME/UNLOCK ÁUDIO (resolve “duplo toque”)
+  function makeSilentWavDataURL(ms = 60, sampleRate = 8000) {
+    // Gera um WAV PCM 16-bit de silêncio curto
+    const samples = Math.max(1, Math.floor((ms / 1000) * sampleRate));
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = samples * blockAlign;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    let o = 0;
+    function writeStr(s: string) {
+      for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i));
+    }
+    function writeUint32(v: number) {
+      view.setUint32(o, v, true);
+      o += 4;
+    }
+    function writeUint16(v: number) {
+      view.setUint16(o, v, true);
+      o += 2;
+    }
+
+    writeStr("RIFF");
+    writeUint32(36 + dataSize);
+    writeStr("WAVE");
+    writeStr("fmt ");
+    writeUint32(16); // subchunk1 size (PCM)
+    writeUint16(1); // audio format PCM
+    writeUint16(numChannels);
+    writeUint32(sampleRate);
+    writeUint32(byteRate);
+    writeUint16(blockAlign);
+    writeUint16(16); // bits per sample
+    writeStr("data");
+    writeUint32(dataSize);
+
+    // corpo de silêncio (zeros)
+    for (let i = 0; i < dataSize; i++) view.setInt8(o++, 0);
+
+    const blob = new Blob([buffer], { type: "audio/wav" });
+    return URL.createObjectURL(blob);
+  }
+
+  async function ensureAudioReady() {
+    if (audioPrimedRef.current) return;
+    const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
+    if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
+    try {
+      await audioCtxRef.current?.resume();
+    } catch {}
+    const el = ttsAudioRef.current;
+    if (el) {
+      try {
+        // tocar uma wav silenciosa curtinha e pausar — desbloqueia autoplay
+        const url = makeSilentWavDataURL(80);
+        el.src = url;
+        el.muted = true;
+        await el.play().catch(() => {});
+        el.pause();
+        el.currentTime = 0;
+        el.muted = false;
+        URL.revokeObjectURL(url);
+      } catch {}
+    }
+    audioPrimedRef.current = true;
+  }
 
   function startOutputMeter() {
     if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
@@ -93,6 +161,7 @@ export default function Page() {
     const ctx = audioCtxRef.current || new AC();
     audioCtxRef.current = ctx;
 
+    // ligar o elemento ao AudioContext para lipsync
     const src = ctx.createMediaElementSource(el);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
@@ -130,30 +199,15 @@ export default function Page() {
       el.crossOrigin = "anonymous";
     }
 
-    // desbloqueio áudio + AC no 1º toque
-    const unlock = async () => {
-      const a = ttsAudioRef.current;
-      if (!a) return;
-      try {
-        a.muted = true;
-        await a.play().catch(() => {});
-        a.pause();
-        a.currentTime = 0;
-        a.muted = false;
-      } catch {}
-      try {
-        const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
-        if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
-      } catch {}
-      document.removeEventListener("click", unlock);
-      document.removeEventListener("touchstart", unlock);
+    // Unlock no primeiro gesto (tap/click)
+    const onFirstGesture = async () => {
+      await ensureAudioReady();
+      document.removeEventListener("pointerdown", onFirstGesture);
     };
-    document.addEventListener("click", unlock, { once: true });
-    document.addEventListener("touchstart", unlock, { once: true });
+    document.addEventListener("pointerdown", onFirstGesture, { once: true });
 
     return () => {
-      document.removeEventListener("click", unlock);
-      document.removeEventListener("touchstart", unlock);
+      document.removeEventListener("pointerdown", onFirstGesture);
       if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
       try {
         audioCtxRef.current?.close();
@@ -161,25 +215,9 @@ export default function Page() {
     };
   }, []);
 
-  // NOVO: saber quando está a falar (para o tap curto parar TTS)
-  useEffect(() => {
-    const a = ttsAudioRef.current;
-    if (!a) return;
-    const onPlay = () => setIsSpeaking(true);
-    const onEnd = () => setIsSpeaking(false);
-    const onPause = () => setIsSpeaking(false);
-    a.addEventListener("play", onPlay);
-    a.addEventListener("ended", onEnd);
-    a.addEventListener("pause", onPause);
-    return () => {
-      a.removeEventListener("play", onPlay);
-      a.removeEventListener("ended", onEnd);
-      a.removeEventListener("pause", onPause);
-    };
-  }, []);
-
   // --- Micro
   async function requestMic() {
+    await ensureAudioReady(); // <- garante unlock junto com pedido do mic
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -195,12 +233,21 @@ export default function Page() {
   }
 
   function startHold() {
+    // Se a Alma estiver a falar, tocar no botão interrompe (em vez de começar a gravar)
+    const a = ttsAudioRef.current;
+    if (a && !a.paused && !a.ended) {
+      a.pause();
+      a.currentTime = 0;
+      setStatus("Pronto");
+      return;
+    }
+
     if (!isArmed) {
       requestMic();
       return;
     }
     if (!streamRef.current) {
-      setStatus("⚠️ Micro não está pronto. Tenta de novo.");
+      setStatus("⚠️ Micro não está pronto. Carrega primeiro em 'Ativar micro'.");
       return;
     }
     try {
@@ -250,7 +297,6 @@ export default function Page() {
       const sttResp = await fetch("/api/stt", { method: "POST", body: fd });
       if (!sttResp.ok) {
         const txt = await sttResp.text();
-        setTranscript("");
         setStatus("⚠️ STT " + sttResp.status + ": " + txt.slice(0, 200));
         return;
       }
@@ -272,6 +318,7 @@ export default function Page() {
   async function speak(text: string) {
     if (!text) return;
     try {
+      await ensureAudioReady(); // <- garante que o elemento pode tocar
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -305,12 +352,6 @@ export default function Page() {
     }
   }
 
-  async function testVoice() {
-    setStatus("🔊 A testar voz…");
-    await speak("Olá! Sou a Alma. Estás a ouvir bem?");
-    setStatus("Pronto");
-  }
-
   async function askAlma(question: string) {
     setStatus("🧠 A perguntar à Alma…");
     setAnswer("");
@@ -337,88 +378,14 @@ export default function Page() {
     }
   }
 
-  async function sendTyped() {
-    const q = typed.trim();
-    if (!q) return;
-    setStatus("🧠 A perguntar à Alma…");
-    setTranscript(q);
-    setLog((l) => [...l, { role: "you", text: q }]);
-    setAnswer("");
-    setTyped("");
-
-    try {
-      const almaResp = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, user_id: USER_ID }),
-      });
-      if (!almaResp.ok) {
-        const txt = await almaResp.text();
-        setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
-        return;
-      }
-      const almaJson = (await almaResp.json()) as { answer?: string };
-      const out = (almaJson.answer || "").trim();
-      setAnswer(out);
-      setLog((l) => [...l, { role: "alma", text: out }]);
-      setStatus("🔊 A falar…");
-      await speak(out);
-      setStatus("Pronto");
-    } catch (e: any) {
-      setStatus("⚠️ Erro: " + (e?.message || e));
-    }
-  }
-
-  // --- Botão único (tap para parar / segurar para falar)
-  async function handleTap() {
-    const a = ttsAudioRef.current;
-    if (isSpeaking && a) {
-      a.pause();
-      a.currentTime = 0;
-      setStatus("⏹️ Interrompido.");
-      return;
-    }
-    if (!firstPressDone) {
-      if (!isArmed) await requestMic();
-      await testVoice();
-      setFirstPressDone(true);
-      setStatus("Pronto");
-      return;
-    }
-    // tap curto depois disto não faz nada (o gesto principal é “segurar”)
-  }
-
-  function onButtonPointerDown(e: React.PointerEvent) {
+  // Touch handlers (hold)
+  function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
-    pressTimerRef.current = window.setTimeout(() => {
-      holdingRef.current = true;
-      startHold();
-    }, HOLD_DELAY_MS);
+    ensureAudioReady().finally(() => startHold());
   }
-
-  function onButtonPointerUp(e: React.PointerEvent) {
+  function onHoldEnd(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
-    if (pressTimerRef.current) {
-      clearTimeout(pressTimerRef.current);
-      pressTimerRef.current = null;
-    }
-    if (holdingRef.current) {
-      holdingRef.current = false;
-      stopHold();
-    } else {
-      handleTap();
-    }
-  }
-
-  function onButtonPointerLeave() {
-    if (pressTimerRef.current) {
-      clearTimeout(pressTimerRef.current);
-      pressTimerRef.current = null;
-    }
-    if (holdingRef.current) {
-      holdingRef.current = false;
-      stopHold();
-    }
+    stopHold();
   }
 
   function copyLog() {
@@ -448,7 +415,7 @@ export default function Page() {
         style={{
           width: "100%",
           height: 520,
-          marginBottom: 16,
+          marginBottom: 10,
           border: `1px solid ${colors.border}`,
           borderRadius: 16,
           overflow: "hidden",
@@ -462,89 +429,61 @@ export default function Page() {
       {/* player TTS no DOM (hidden-ish) */}
       <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
 
-      {/* STATUS */}
+      {/* STATUS — invisível, sem borda e texto centrado */}
       <div
         style={{
           marginBottom: 16,
-          padding: "10px 12px",
-          border: `1px solid ${colors.border}`,
-          borderRadius: 10,
-          background: colors.panel2,
+          padding: "6px 8px",
+          border: "none",
+          borderRadius: 0,
+          background: colors.bg, // mesma cor do fundo → invisível
           color: colors.fgDim,
+          textAlign: "center",
+          minHeight: 20,
         }}
       >
         {status}
       </div>
 
-      {/* Botão ÚNICO redondo — sem legenda */}
-      <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+      {/* Controlo: apenas dois botões (Ativar micro + redondo hold). Sem legenda por baixo. */}
+      <div style={{ display: "flex", gap: 12, justifyContent: "center", marginBottom: 16, flexWrap: "wrap" }}>
         <button
-          onPointerDown={onButtonPointerDown}
-          onPointerUp={onButtonPointerUp}
-          onPointerLeave={onButtonPointerLeave}
+          onClick={requestMic}
           style={{
+            ...btnBase,
+            background: isArmed ? "#133015" : "#19191e",
+            color: isArmed ? "#9BE29B" : colors.fg,
+            borderColor: isArmed ? "rgba(155,226,155,0.25)" : colors.border,
+          }}
+        >
+          {isArmed ? "Micro pronto ✅" : "Ativar micro"}
+        </button>
+
+        <button
+          onMouseDown={onHoldStart}
+          onMouseUp={onHoldEnd}
+          onTouchStart={onHoldStart}
+          onTouchEnd={onHoldEnd}
+          style={{
+            ...btnPrimary,
+            width: 56,
+            height: 56,
             padding: 0,
-            width: 88,
-            height: 88,
-            borderRadius: "50%",
-            border: "1px solid rgba(0,0,0,0.35)",
-            background: isSpeaking ? "#8b0000" : (isRecording ? "#8b0000" : colors.accent),
-            color: isRecording || isSpeaking ? "#fff" : "#000",
-            fontWeight: 700,
+            borderRadius: 999,
+            background: isRecording ? "#8b0000" : colors.accent,
+            color: isRecording ? "#fff" : "#000",
             display: "grid",
             placeItems: "center",
-            boxShadow: "0 10px 30px rgba(0,0,0,.35)",
-            cursor: "pointer",
-            userSelect: "none",
+            fontSize: 20,
           }}
-          title={
-            isRecording
-              ? "A gravar… larga para enviar"
-              : !firstPressDone
-              ? "Falar com a Alma (ativa voz e teste)"
-              : isSpeaking
-              ? "Tocar para interromper"
-              : "Segurar para falar"
-          }
+          aria-label="Segurar para falar"
+          title="Segurar para falar"
         >
-          <div style={{ textAlign: "center", lineHeight: 1.1, fontSize: 14 }}>
-            {isRecording ? "A gravar" : isSpeaking ? "Parar" : firstPressDone ? "🎤" : "Falar"}
-          </div>
+          🎤
         </button>
       </div>
 
-      {/* Entrada por texto (mantida) */}
-      <div
-        style={{
-          display: "flex",
-          gap: 10,
-          marginBottom: 18,
-          alignItems: "stretch",
-        }}
-      >
-        <input
-          value={typed}
-          onChange={(e) => setTyped(e.target.value)}
-          placeholder="Escreve aqui para perguntar à Alma…"
-          style={{
-            flex: 1,
-            padding: "14px 14px",
-            borderRadius: 12,
-            border: `1px solid ${colors.border}`,
-            background: "#101014",
-            color: colors.fg,
-            outline: "none",
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") sendTyped();
-          }}
-        />
-        <button onClick={sendTyped} style={{ ...btnPrimary, minWidth: 120 }}>
-          Enviar
-        </button>
-      </div>
-
-      {/* Conversa — apenas balões + link copiar no canto */}
+      {/* Conversa — sem “Último”, sem “Histórico”, com botão copiar no canto inf. direito */}
       <div
         style={{
           position: "relative",
@@ -553,41 +492,15 @@ export default function Page() {
           padding: 14,
           background: colors.panel,
           boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
+          minHeight: 80,
         }}
       >
-        {/* Link “copiar” no canto inferior direito */}
-        <button
-          onClick={copyLog}
-          style={{
-            position: "absolute",
-            right: 12,
-            bottom: 10,
-            background: "transparent",
-            border: "none",
-            color: colors.fgDim,
-            fontSize: 12,
-            cursor: "pointer",
-            textDecoration: "underline",
-            padding: 4,
-          }}
-          title="Copiar histórico"
-        >
-          copiar
-        </button>
-
-        {/* Balões */}
         <div style={{ display: "grid", gap: 10 }}>
           {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
           {log.map((m, i) => {
             const right = m.role === "alma";
             return (
-              <div
-                key={i}
-                style={{
-                  display: "flex",
-                  justifyContent: right ? "flex-end" : "flex-start",
-                }}
-              >
+              <div key={i} style={{ display: "flex", justifyContent: right ? "flex-end" : "flex-start" }}>
                 <div
                   style={{
                     maxWidth: "720px",
@@ -609,6 +522,24 @@ export default function Page() {
             );
           })}
         </div>
+
+        <button
+          onClick={copyLog}
+          style={{
+            position: "absolute",
+            right: 10,
+            bottom: 10,
+            fontSize: 12,
+            background: "transparent",
+            border: "none",
+            color: colors.fgDim,
+            cursor: "pointer",
+            padding: 6,
+          }}
+          title="Copiar histórico"
+        >
+          copiar
+        </button>
       </div>
     </main>
   );
