@@ -43,11 +43,6 @@ export default function Page() {
     color: colors.fg,
     cursor: "pointer",
   };
-  const btnSubtle: React.CSSProperties = {
-    ...btnBase,
-    background: "#14141a",
-    color: colors.fgDim,
-  };
   const btnPrimary: React.CSSProperties = {
     ...btnBase,
     background: colors.accent,
@@ -56,17 +51,22 @@ export default function Page() {
     fontWeight: 600,
   };
 
-  // --- UI state (mantido)
+  // --- UI state
   const [status, setStatus] = useState<string>("Pronto");
   const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
   const [typed, setTyped] = useState("");
+
   const [log, setLog] = useState<LogItem[]>([]);
 
-  // controla o primeiro clique no botão amarelo: ativa teste de voz e passa a “segurar para falar”
+  // NOVO: estado p/ botão único
   const [firstPressDone, setFirstPressDone] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const pressTimerRef = useRef<number | null>(null);
+  const holdingRef = useRef(false);
+  const HOLD_DELAY_MS = 250;
 
   // --- Audio / Recorder
   const streamRef = useRef<MediaStream | null>(null);
@@ -130,7 +130,7 @@ export default function Page() {
       el.crossOrigin = "anonymous";
     }
 
-    // Desbloqueio de áudio em iOS/Safari após gesto
+    // desbloqueio áudio + AC no 1º toque
     const unlock = async () => {
       const a = ttsAudioRef.current;
       if (!a) return;
@@ -151,15 +151,6 @@ export default function Page() {
     document.addEventListener("click", unlock, { once: true });
     document.addEventListener("touchstart", unlock, { once: true });
 
-    // Auto-armar vindo do index: .../alma-frontend?arm=1
-    try {
-      const p = new URLSearchParams(location.search);
-      if (p.get("arm") === "1") {
-        // pequeno atraso para deixar a página montar
-        setTimeout(() => requestMic(), 50);
-      }
-    } catch {}
-
     return () => {
       document.removeEventListener("click", unlock);
       document.removeEventListener("touchstart", unlock);
@@ -167,6 +158,23 @@ export default function Page() {
       try {
         audioCtxRef.current?.close();
       } catch {}
+    };
+  }, []);
+
+  // NOVO: saber quando está a falar (para o tap curto parar TTS)
+  useEffect(() => {
+    const a = ttsAudioRef.current;
+    if (!a) return;
+    const onPlay = () => setIsSpeaking(true);
+    const onEnd = () => setIsSpeaking(false);
+    const onPause = () => setIsSpeaking(false);
+    a.addEventListener("play", onPlay);
+    a.addEventListener("ended", onEnd);
+    a.addEventListener("pause", onPause);
+    return () => {
+      a.removeEventListener("play", onPlay);
+      a.removeEventListener("ended", onEnd);
+      a.removeEventListener("pause", onPause);
     };
   }, []);
 
@@ -187,24 +195,12 @@ export default function Page() {
   }
 
   function startHold() {
-    // Primeiro clique: armar + teste de voz (e não gravamos ainda)
-    if (!firstPressDone) {
-      const go = async () => {
-        if (!isArmed) await requestMic();
-        await testVoice();
-        setFirstPressDone(true);
-        setStatus("Pronto");
-      };
-      go();
-      return;
-    }
-
     if (!isArmed) {
       requestMic();
       return;
     }
     if (!streamRef.current) {
-      setStatus("⚠️ Micro não está pronto.");
+      setStatus("⚠️ Micro não está pronto. Tenta de novo.");
       return;
     }
     try {
@@ -312,6 +308,7 @@ export default function Page() {
   async function testVoice() {
     setStatus("🔊 A testar voz…");
     await speak("Olá! Sou a Alma. Estás a ouvir bem?");
+    setStatus("Pronto");
   }
 
   async function askAlma(question: string) {
@@ -372,20 +369,63 @@ export default function Page() {
     }
   }
 
-  // Touch handlers (hold)
-  function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
-    e.preventDefault();
-    startHold();
-  }
-  function onHoldEnd(e: React.MouseEvent | React.TouchEvent) {
-    e.preventDefault();
-    stopHold();
+  // --- Botão único (tap para parar / segurar para falar)
+  async function handleTap() {
+    const a = ttsAudioRef.current;
+    if (isSpeaking && a) {
+      a.pause();
+      a.currentTime = 0;
+      setStatus("⏹️ Interrompido.");
+      return;
+    }
+    if (!firstPressDone) {
+      if (!isArmed) await requestMic();
+      await testVoice();
+      setFirstPressDone(true);
+      setStatus("Pronto");
+      return;
+    }
+    // tap curto depois disto não faz nada (o gesto principal é “segurar”)
   }
 
-  function copyOne(text: string) {
-    navigator.clipboard.writeText(text).then(() => {
-      setStatus("Copiado.");
-      setTimeout(() => setStatus("Pronto"), 900);
+  function onButtonPointerDown(e: React.PointerEvent) {
+    e.preventDefault();
+    pressTimerRef.current = window.setTimeout(() => {
+      holdingRef.current = true;
+      startHold();
+    }, HOLD_DELAY_MS);
+  }
+
+  function onButtonPointerUp(e: React.PointerEvent) {
+    e.preventDefault();
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+    if (holdingRef.current) {
+      holdingRef.current = false;
+      stopHold();
+    } else {
+      handleTap();
+    }
+  }
+
+  function onButtonPointerLeave() {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+    if (holdingRef.current) {
+      holdingRef.current = false;
+      stopHold();
+    }
+  }
+
+  function copyLog() {
+    const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
+    navigator.clipboard.writeText(txt).then(() => {
+      setStatus("Histórico copiado.");
+      setTimeout(() => setStatus("Pronto"), 1200);
     });
   }
 
@@ -422,99 +462,92 @@ export default function Page() {
       {/* player TTS no DOM (hidden-ish) */}
       <audio id="tts-audio" style={{ width: 0, height: 0, opacity: 0 }} />
 
-      {/* STATUS — sem borda e centrado */}
+      {/* STATUS */}
       <div
         style={{
-          marginBottom: 12,
-          padding: "6px 8px",
-          border: "none",
+          marginBottom: 16,
+          padding: "10px 12px",
+          border: `1px solid ${colors.border}`,
           borderRadius: 10,
-          background: "transparent",
+          background: colors.panel2,
           color: colors.fgDim,
-          textAlign: "center",
-          fontWeight: 500,
-          minHeight: 24,
         }}
       >
         {status}
       </div>
 
-      {/* Controlo de micro — dois botões, centrados */}
-      <div style={{ display: "flex", gap: 14, justifyContent: "center", alignItems: "center", marginBottom: 16 }}>
-        {/* Botão redondo amarelo */}
+      {/* Botão ÚNICO redondo — sem legenda */}
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
         <button
-          onMouseDown={onHoldStart}
-          onMouseUp={onHoldEnd}
-          onTouchStart={onHoldStart}
-          onTouchEnd={onHoldEnd}
+          onPointerDown={onButtonPointerDown}
+          onPointerUp={onButtonPointerUp}
+          onPointerLeave={onButtonPointerLeave}
           style={{
-            ...btnPrimary,
-            width: 72,
-            height: 72,
-            borderRadius: "50%",
             padding: 0,
-            fontSize: 12,
-            background: isRecording ? "#8b0000" : colors.accent,
-            color: isRecording ? "#fff" : "#000",
+            width: 88,
+            height: 88,
+            borderRadius: "50%",
+            border: "1px solid rgba(0,0,0,0.35)",
+            background: isSpeaking ? "#8b0000" : (isRecording ? "#8b0000" : colors.accent),
+            color: isRecording || isSpeaking ? "#fff" : "#000",
+            fontWeight: 700,
             display: "grid",
             placeItems: "center",
+            boxShadow: "0 10px 30px rgba(0,0,0,.35)",
+            cursor: "pointer",
+            userSelect: "none",
           }}
-          title={firstPressDone ? (isRecording ? "A gravar… solta para enviar" : "Segurar para falar") : "Falar com a Alma"}
+          title={
+            isRecording
+              ? "A gravar… larga para enviar"
+              : !firstPressDone
+              ? "Falar com a Alma (ativa voz e teste)"
+              : isSpeaking
+              ? "Tocar para interromper"
+              : "Segurar para falar"
+          }
         >
-          <div style={{ textAlign: "center", lineHeight: 1.1 }}>
-            {firstPressDone ? (isRecording ? "A gravar" : "🎤") : "Falar"}
+          <div style={{ textAlign: "center", lineHeight: 1.1, fontSize: 14 }}>
+            {isRecording ? "A gravar" : isSpeaking ? "Parar" : firstPressDone ? "🎤" : "Falar"}
           </div>
-        </button>
-
-        {/* Botão “parar” quadrado */}
-        <button
-          onClick={() => {
-            const a = ttsAudioRef.current;
-            if (a) {
-              a.pause();
-              a.currentTime = 0;
-            }
-          }}
-          style={{
-            ...btnSubtle,
-            width: 56,
-            height: 56,
-            borderRadius: 12,
-            display: "grid",
-            placeItems: "center",
-            fontSize: 18,
-          }}
-          title="Interromper fala"
-        >
-          ⏹️
         </button>
       </div>
 
-      {/* Entrada por texto — sem borda e centrado */}
-      <div style={{ display: "flex", gap: 10, marginBottom: 18, alignItems: "stretch", justifyContent: "center" }}>
+      {/* Entrada por texto (mantida) */}
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          marginBottom: 18,
+          alignItems: "stretch",
+        }}
+      >
         <input
           value={typed}
           onChange={(e) => setTyped(e.target.value)}
-          placeholder="perguntar à alma"
+          placeholder="Escreve aqui para perguntar à Alma…"
           style={{
-            flex: "0 1 720px",
+            flex: 1,
             padding: "14px 14px",
             borderRadius: 12,
-            border: "none",
-            background: "transparent",
+            border: `1px solid ${colors.border}`,
+            background: "#101014",
             color: colors.fg,
             outline: "none",
-            textAlign: "center",
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") sendTyped();
           }}
         />
+        <button onClick={sendTyped} style={{ ...btnPrimary, minWidth: 120 }}>
+          Enviar
+        </button>
       </div>
 
-      {/* Conversa — estilo tipo “bubbles” como no alma-chat, com ‘copiar’ por balão */}
+      {/* Conversa — apenas balões + link copiar no canto */}
       <div
         style={{
+          position: "relative",
           border: `1px solid ${colors.border}`,
           borderRadius: 14,
           padding: 14,
@@ -522,94 +555,59 @@ export default function Page() {
           boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
         }}
       >
-        {/* Último turno (mantido) */}
-        <div
+        {/* Link “copiar” no canto inferior direito */}
+        <button
+          onClick={copyLog}
           style={{
-            marginBottom: 12,
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: 10,
+            position: "absolute",
+            right: 12,
+            bottom: 10,
+            background: "transparent",
+            border: "none",
+            color: colors.fgDim,
+            fontSize: 12,
+            cursor: "pointer",
+            textDecoration: "underline",
+            padding: 4,
           }}
+          title="Copiar histórico"
         >
-          <div
-            style={{
-              border: `1px solid ${colors.border}`,
-              borderRadius: 12,
-              padding: 10,
-              background: colors.panel2,
-            }}
-          >
-            <div style={{ fontWeight: 600, color: colors.fgDim, marginBottom: 6 }}>Tu (último):</div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{transcript || "—"}</div>
-          </div>
-          <div
-            style={{
-              border: `1px solid ${colors.border}`,
-              borderRadius: 12,
-              padding: 10,
-              background: colors.panel2,
-            }}
-          >
-            <div style={{ fontWeight: 600, color: colors.fgDim, marginBottom: 6 }}>Alma (último):</div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{answer || "—"}</div>
-          </div>
-        </div>
+          copiar
+        </button>
 
-        {/* Histórico */}
-        <div>
-          <div style={{ fontWeight: 600, color: colors.fgDim, marginBottom: 10 }}>Histórico</div>
+        {/* Balões */}
+        <div style={{ display: "grid", gap: 10 }}>
           {log.length === 0 && <div style={{ opacity: 0.6 }}>—</div>}
-          <div style={{ display: "grid", gap: 10 }}>
-            {log.map((m, i) => {
-              const right = m.role === "alma";
-              return (
+          {log.map((m, i) => {
+            const right = m.role === "alma";
+            return (
+              <div
+                key={i}
+                style={{
+                  display: "flex",
+                  justifyContent: right ? "flex-end" : "flex-start",
+                }}
+              >
                 <div
-                  key={i}
                   style={{
-                    display: "flex",
-                    justifyContent: right ? "flex-end" : "flex-start",
+                    maxWidth: "720px",
+                    padding: "12px 14px",
+                    borderRadius: 14,
+                    border: `1px solid rgba(255,255,255,0.06)`,
+                    background: right ? colors.bubbleAlma : colors.bubbleUser,
+                    color: colors.fg,
+                    whiteSpace: "pre-wrap",
+                    boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
                   }}
                 >
-                  <div
-                    style={{
-                      position: "relative",
-                      maxWidth: "720px",
-                      padding: "12px 14px",
-                      borderRadius: 14,
-                      border: `1px solid rgba(255,255,255,0.06)`,
-                      background: right ? colors.bubbleAlma : colors.bubbleUser,
-                      color: colors.fg,
-                      whiteSpace: "pre-wrap",
-                      boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
-                    }}
-                  >
-                    <div style={{ fontSize: 12, color: colors.fgDim, marginBottom: 6 }}>
-                      {m.role === "you" ? "Tu" : "Alma"}
-                    </div>
-                    {m.text}
-                    <button
-                      onClick={() => copyOne(m.text)}
-                      style={{
-                        position: "absolute",
-                        top: 8,
-                        right: 8,
-                        fontSize: 11,
-                        padding: "4px 8px",
-                        borderRadius: 8,
-                        border: `1px solid ${colors.border}`,
-                        background: "#121217",
-                        color: colors.fgDim,
-                        cursor: "pointer",
-                      }}
-                      title="Copiar"
-                    >
-                      copiar
-                    </button>
+                  <div style={{ fontSize: 12, color: colors.fgDim, marginBottom: 6 }}>
+                    {m.role === "you" ? "Tu" : "Alma"}
                   </div>
+                  {m.text}
                 </div>
-              );
-            })}
-          </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     </main>
