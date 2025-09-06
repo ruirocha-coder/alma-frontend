@@ -36,19 +36,15 @@ export default function Page() {
 
   // helpers visuais (apenas estilo)
   const btnBase: React.CSSProperties = {
-    padding: "10px 14px",
-    borderRadius: 10,
-    border: `1px solid ${colors.border}`,
-    background: "#19191e",
-    color: colors.fg,
-    cursor: "pointer",
-  };
-  const btnPrimary: React.CSSProperties = {
-    ...btnBase,
+    padding: "12px 18px",
+    borderRadius: 999,
+    border: `1px solid rgba(0,0,0,0.35)`,
     background: colors.accent,
     color: "#000",
-    borderColor: "rgba(0,0,0,0.35)",
-    fontWeight: 600,
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
+    userSelect: "none",
   };
 
   // --- UI state
@@ -329,7 +325,7 @@ export default function Page() {
     }
   }
 
-  // Pointer handlers para botão único
+  // Pointer handlers para botão único (pill)
   function onHoldStart(e: React.PointerEvent | React.TouchEvent | React.MouseEvent) {
     e.preventDefault();
     startHold();
@@ -396,7 +392,7 @@ export default function Page() {
         {status}
       </div>
 
-      {/* Controlo: apenas o botão redondo (primeiro clique ativa micro; seguintes, segurar para gravar) */}
+      {/* Botão horizontal “Segura para fala” */}
       <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
         <button
           onPointerDown={onHoldStart as any}
@@ -404,23 +400,21 @@ export default function Page() {
           onPointerCancel={onHoldEnd as any}
           onPointerLeave={onHoldEnd as any}
           style={{
-            ...btnPrimary,
-            width: 56,
-            height: 56,
-            padding: 0,
+            ...btnBase,
+            width: 260,
+            height: 52,
             borderRadius: 999,
             background: isRecording ? "#8b0000" : colors.accent,
             color: isRecording ? "#fff" : "#000",
-            display: "grid",
-            placeItems: "center",
-            fontSize: 20,
+            letterSpacing: 0.2,
+            fontSize: 16,
             touchAction: "none",
             WebkitTapHighlightColor: "transparent",
           }}
-          aria-label={isArmed ? "Segurar para falar" : "Ativar micro"}
-          title={isArmed ? "Segurar para falar" : "Ativar micro"}
+          aria-label={isArmed ? "Segura para fala (manter pressionado)" : "Ativar micro (primeiro toque)"}
+          title={isArmed ? "Segura para fala" : "Ativar micro"}
         >
-          🎤
+          {isRecording ? "A gravar… solta para enviar" : "Segura para fala"}
         </button>
       </div>
 
@@ -465,13 +459,7 @@ export default function Page() {
         </div>
 
         <button
-          onClick={() => {
-            const txt = log.map((l) => (l.role === "you" ? "Tu: " : "Alma: ") + l.text).join("\n");
-            navigator.clipboard.writeText(txt).then(() => {
-              setStatus("Histórico copiado.");
-              setTimeout(() => setStatus("Pronto"), 1200);
-            });
-          }}
+          onClick={copyLog}
           style={{
             position: "absolute",
             right: 10,
