@@ -41,10 +41,9 @@ export default function Page() {
     border: `1px solid rgba(0,0,0,0.35)`,
     background: colors.accent,
     color: "#000",
-    fontWeight: 700,
     cursor: "pointer",
-    boxShadow: "0 1px 0 rgba(255,255,255,0.03), 0 8px 24px rgba(0,0,0,0.25)",
-    userSelect: "none",
+    fontWeight: 700,
+    letterSpacing: 0.2,
   };
 
   // --- UI state
@@ -53,6 +52,7 @@ export default function Page() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
+  const [typed, setTyped] = useState<string>(""); // caixa texto→voz
 
   const [log, setLog] = useState<LogItem[]>([]);
 
@@ -81,14 +81,17 @@ export default function Page() {
     const dataSize = samples * blockAlign;
     const buffer = new ArrayBuffer(44 + dataSize);
     const view = new DataView(buffer);
+
     let o = 0;
-    const wStr = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i)); };
-    const w32 = (v: number) => { view.setUint32(o, v, true); o += 4; };
-    const w16 = (v: number) => { view.setUint16(o, v, true); o += 2; };
-    wStr("RIFF"); w32(36 + dataSize); wStr("WAVE"); wStr("fmt "); w32(16);
-    w16(1); w16(numChannels); w32(sampleRate); w32(byteRate); w16(blockAlign); w16(16);
-    wStr("data"); w32(dataSize);
+    const W = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i)); };
+    const U32 = (v: number) => { view.setUint32(o, v, true); o += 4; };
+    const U16 = (v: number) => { view.setUint16(o, v, true); o += 2; };
+
+    W("RIFF"); U32(36 + dataSize); W("WAVE"); W("fmt "); U32(16); U16(1);
+    U16(numChannels); U32(sampleRate); U32(byteRate); U16(blockAlign); U16(16);
+    W("data"); U32(dataSize);
     for (let i = 0; i < dataSize; i++) view.setInt8(o++, 0);
+
     const blob = new Blob([buffer], { type: "audio/wav" });
     return URL.createObjectURL(blob);
   }
@@ -105,9 +108,7 @@ export default function Page() {
         el.src = url;
         el.muted = true;
         await el.play().catch(() => {});
-        el.pause();
-        el.currentTime = 0;
-        el.muted = false;
+        el.pause(); el.currentTime = 0; el.muted = false;
         URL.revokeObjectURL(url);
       } catch {}
     }
@@ -118,16 +119,21 @@ export default function Page() {
     if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
     const el = ttsAudioRef.current;
     if (!el) return;
+
     const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
     if (!AC) return;
+
     const ctx = audioCtxRef.current || new AC();
     audioCtxRef.current = ctx;
+
     const src = ctx.createMediaElementSource(el);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0.7;
+
     src.connect(analyser);
     analyser.connect(ctx.destination);
+
     analyserRef.current = analyser;
 
     const data = new Uint8Array(analyser.frequencyBinCount);
@@ -139,7 +145,8 @@ export default function Page() {
         sum += v * v;
       }
       const rms = Math.sqrt(sum / data.length);
-      audioLevelRef.current = Math.min(1, rms * 4);
+      const level = Math.min(1, rms * 4);
+      audioLevelRef.current = level;
       meterRAF.current = requestAnimationFrame(tick);
     };
     if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
@@ -155,7 +162,16 @@ export default function Page() {
       el.preload = "auto";
       el.crossOrigin = "anonymous";
     }
+
+    // Desbloqueio no primeiro gesto (tap/click)
+    const onFirstGesture = async () => {
+      await ensureAudioReady();
+      document.removeEventListener("pointerdown", onFirstGesture);
+    };
+    document.addEventListener("pointerdown", onFirstGesture, { once: true });
+
     return () => {
+      document.removeEventListener("pointerdown", onFirstGesture);
       if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
       try { audioCtxRef.current?.close(); } catch {}
     };
@@ -163,7 +179,7 @@ export default function Page() {
 
   // --- Micro
   async function requestMic() {
-    await ensureAudioReady(); // desbloqueio + pedido juntos
+    await ensureAudioReady(); // unlock + mic
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -178,17 +194,15 @@ export default function Page() {
     }
   }
 
-  // --- Gravação
   function startHold() {
-    // Se a Alma estiver a falar, um toque interrompe
+    // Se a Alma estiver a falar, tocar no botão interrompe
     const a = ttsAudioRef.current;
     if (a && !a.paused && !a.ended) {
-      a.pause();
-      a.currentTime = 0;
+      a.pause(); a.currentTime = 0;
       setStatus("Pronto");
       return;
     }
-    // 1º clique do botão (sem micro armado) → só ativa micro e sai
+    // 1º clique: ativa áudio+micro; 2º clique/segurar: grava
     if (!isArmed) {
       requestMic();
       return;
@@ -211,9 +225,7 @@ export default function Page() {
       const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
       mediaRecorderRef.current = mr;
 
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-      };
+      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunksRef.current.push(e.data); };
       mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
@@ -325,12 +337,21 @@ export default function Page() {
     }
   }
 
-  // Pointer handlers para botão único (pill)
-  function onHoldStart(e: React.PointerEvent | React.TouchEvent | React.MouseEvent) {
-    e.preventDefault();
-    startHold();
+  // Enviar texto digitado
+  async function sendTyped() {
+    const q = typed.trim();
+    if (!q) return;
+    setTyped("");
+    setLog((l) => [...l, { role: "you", text: q }]);
+    await askAlma(q);
   }
-  function onHoldEnd(e: React.PointerEvent | React.TouchEvent | React.MouseEvent) {
+
+  // Touch handlers (hold)
+  function onHoldStart(e: React.MouseEvent | React.TouchEvent) {
+    e.preventDefault();
+    ensureAudioReady().finally(() => startHold());
+  }
+  function onHoldEnd(e: React.MouseEvent | React.TouchEvent) {
     e.preventDefault();
     stopHold();
   }
@@ -392,30 +413,47 @@ export default function Page() {
         {status}
       </div>
 
-      {/* Botão horizontal “Segura para fala” */}
-      <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+      {/* Botão único horizontal (ativa micro no 1º toque; segurar para falar no 2º) */}
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
         <button
-          onPointerDown={onHoldStart as any}
-          onPointerUp={onHoldEnd as any}
-          onPointerCancel={onHoldEnd as any}
-          onPointerLeave={onHoldEnd as any}
+          onMouseDown={onHoldStart}
+          onMouseUp={onHoldEnd}
+          onTouchStart={onHoldStart}
+          onTouchEnd={onHoldEnd}
           style={{
             ...btnBase,
-            width: 260,
+            width: 320,
+            maxWidth: "92%",
             height: 52,
-            borderRadius: 999,
             background: isRecording ? "#8b0000" : colors.accent,
             color: isRecording ? "#fff" : "#000",
-            letterSpacing: 0.2,
             fontSize: 16,
-            touchAction: "none",
-            WebkitTapHighlightColor: "transparent",
           }}
-          aria-label={isArmed ? "Segura para fala (manter pressionado)" : "Ativar micro (primeiro toque)"}
-          title={isArmed ? "Segura para fala" : "Ativar micro"}
+          aria-label="Segurar para falar"
+          title="Segurar para falar"
         >
-          {isRecording ? "A gravar… solta para enviar" : "Segura para fala"}
+          {isRecording ? "A gravar… solta para enviar" : "Segurar para falar"}
         </button>
+      </div>
+
+      {/* Caixa de texto → voz (invisível, centrada, sem borda) */}
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+        <input
+          value={typed}
+          onChange={(e) => setTyped(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") sendTyped(); }}
+          placeholder="Escrever para a Alma…"
+          style={{
+            width: 680, maxWidth: "95%",
+            padding: "12px 14px",
+            border: "none",
+            outline: "none",
+            borderRadius: 999,
+            background: "transparent",
+            color: "#cfcfd3",
+            textAlign: "center",
+          }}
+        />
       </div>
 
       {/* Conversa — sem “Último”, sem “Histórico”, com botão copiar no canto inf. direito */}
