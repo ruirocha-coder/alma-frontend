@@ -205,7 +205,7 @@ export default function Page() {
     };
   }, []);
 
-  // --- Micro
+  // ---- Micro
   async function requestMic() {
     await ensureAudioReady(); // unlock + mic
     try {
