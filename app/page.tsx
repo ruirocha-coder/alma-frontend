@@ -53,7 +53,6 @@ export default function Page() {
   const [transcript, setTranscript] = useState<string>("");
   const [answer, setAnswer] = useState<string>("");
   const [typed, setTyped] = useState<string>(""); // caixa texto→voz
-
   const [log, setLog] = useState<LogItem[]>([]);
 
   // --- Audio / Recorder
@@ -83,13 +82,33 @@ export default function Page() {
     const view = new DataView(buffer);
 
     let o = 0;
-    const W = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i)); };
-    const U32 = (v: number) => { view.setUint32(o, v, true); o += 4; };
-    const U16 = (v: number) => { view.setUint16(o, v, true); o += 2; };
+    const W = (s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i));
+    };
+    const U32 = (v: number) => {
+      view.setUint32(o, v, true);
+      o += 4;
+    };
+    const U16 = (v: number) => {
+      view.setUint16(o, v, true);
+      o += 2;
+    };
 
-    W("RIFF"); U32(36 + dataSize); W("WAVE"); W("fmt "); U32(16); U16(1);
-    U16(numChannels); U32(sampleRate); U32(byteRate); U16(blockAlign); U16(16);
-    W("data"); U32(dataSize);
+    W("RIFF");
+    U32(36 + dataSize);
+    W("WAVE");
+    W("fmt ");
+    U32(16);
+    U16(1);
+
+    U16(numChannels);
+    U32(sampleRate);
+    U32(byteRate);
+    U16(blockAlign);
+    U16(16);
+
+    W("data");
+    U32(dataSize);
     for (let i = 0; i < dataSize; i++) view.setInt8(o++, 0);
 
     const blob = new Blob([buffer], { type: "audio/wav" });
@@ -98,9 +117,13 @@ export default function Page() {
 
   async function ensureAudioReady() {
     if (audioPrimedRef.current) return;
+
     const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
     if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
-    try { await audioCtxRef.current?.resume(); } catch {}
+    try {
+      await audioCtxRef.current?.resume();
+    } catch {}
+
     const el = ttsAudioRef.current;
     if (el) {
       try {
@@ -108,7 +131,9 @@ export default function Page() {
         el.src = url;
         el.muted = true;
         await el.play().catch(() => {});
-        el.pause(); el.currentTime = 0; el.muted = false;
+        el.pause();
+        el.currentTime = 0;
+        el.muted = false;
         URL.revokeObjectURL(url);
       } catch {}
     }
@@ -117,6 +142,7 @@ export default function Page() {
 
   function startOutputMeter() {
     if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
+
     const el = ttsAudioRef.current;
     if (!el) return;
 
@@ -133,7 +159,6 @@ export default function Page() {
 
     src.connect(analyser);
     analyser.connect(ctx.destination);
-
     analyserRef.current = analyser;
 
     const data = new Uint8Array(analyser.frequencyBinCount);
@@ -149,6 +174,7 @@ export default function Page() {
       audioLevelRef.current = level;
       meterRAF.current = requestAnimationFrame(tick);
     };
+
     if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
     meterRAF.current = requestAnimationFrame(tick);
   }
@@ -173,7 +199,9 @@ export default function Page() {
     return () => {
       document.removeEventListener("pointerdown", onFirstGesture);
       if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
-      try { audioCtxRef.current?.close(); } catch {}
+      try {
+        audioCtxRef.current?.close();
+      } catch {}
     };
   }, []);
 
@@ -198,10 +226,12 @@ export default function Page() {
     // Se a Alma estiver a falar, tocar no botão interrompe
     const a = ttsAudioRef.current;
     if (a && !a.paused && !a.ended) {
-      a.pause(); a.currentTime = 0;
+      a.pause();
+      a.currentTime = 0;
       setStatus("Pronto");
       return;
     }
+
     // 1º clique: ativa áudio+micro; 2º clique/segurar: grava
     if (!isArmed) {
       requestMic();
@@ -211,21 +241,23 @@ export default function Page() {
       setStatus("⚠️ Micro não está pronto.");
       return;
     }
+
     try {
       setStatus("🎙️ A gravar…");
       chunksRef.current = [];
 
-      const mime =
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "audio/mp4";
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "audio/mp4";
 
       const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
       mediaRecorderRef.current = mr;
 
-      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
       mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
@@ -259,10 +291,13 @@ export default function Page() {
         setStatus("⚠️ STT " + sttResp.status + ": " + txt.slice(0, 200));
         return;
       }
+
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
+
       setTranscript(said);
       setLog((l) => (said ? [...l, { role: "you", text: said }] : l));
+
       if (!said) {
         setStatus("⚠️ Não consegui transcrever o áudio. Fala mais perto do micro.");
         return;
@@ -278,16 +313,19 @@ export default function Page() {
     if (!text) return;
     try {
       await ensureAudioReady();
+
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
+
       if (!r.ok) {
         const txt = await r.text();
         setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
         return;
       }
+
       const ab = await r.arrayBuffer();
       const blob = new Blob([ab], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
@@ -297,8 +335,8 @@ export default function Page() {
         setStatus("⚠️ Áudio não inicializado.");
         return;
       }
-      audio.src = url;
 
+      audio.src = url;
       startOutputMeter();
 
       try {
@@ -314,21 +352,26 @@ export default function Page() {
   async function askAlma(question: string) {
     setStatus("🧠 A perguntar à Alma…");
     setAnswer("");
+
     try {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question, user_id: USER_ID }),
       });
+
       if (!almaResp.ok) {
         const txt = await almaResp.text();
         setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
         return;
       }
+
       const almaJson = (await almaResp.json()) as { answer?: string };
       const out = (almaJson.answer || "").trim();
+
       setAnswer(out);
       setLog((l) => [...l, { role: "alma", text: out }]);
+
       setStatus("🔊 A falar…");
       await speak(out);
       setStatus("Pronto");
@@ -413,7 +456,7 @@ export default function Page() {
         {status}
       </div>
 
-      {/* Botão único horizontal (ativa micro no 1º toque; segurar para falar no 2º) */}
+      {/* Botão único horizontal */}
       <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
         <button
           onMouseDown={onHoldStart}
@@ -436,15 +479,18 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Caixa de texto → voz (invisível, centrada, sem borda) */}
+      {/* Caixa de texto → voz */}
       <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
         <input
           value={typed}
           onChange={(e) => setTyped(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") sendTyped(); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") sendTyped();
+          }}
           placeholder="Escrever para a Alma…"
           style={{
-            width: 680, maxWidth: "95%",
+            width: 680,
+            maxWidth: "95%",
             padding: "12px 14px",
             border: "none",
             outline: "none",
@@ -456,7 +502,7 @@ export default function Page() {
         />
       </div>
 
-      {/* Conversa — sem “Último”, sem “Histórico”, com botão copiar no canto inf. direito */}
+      {/* Conversa */}
       <div
         style={{
           position: "relative",
@@ -514,9 +560,12 @@ export default function Page() {
           copiar
         </button>
       </div>
-<script>
+    </main>
+  );
+}
+
 /* =======================================================
-   HOTFIX ÚNICO — TTS sem ler links (para HTML)
+   HOTFIX ÚNICO — TTS sem ler links (TSX/Next)
    - Interceta fetch("/api/tts")
    - Remove links apenas do texto enviado ao TTS
    - NÃO altera UI/log (o texto continua a aparecer no ecrã)
@@ -525,10 +574,10 @@ export default function Page() {
   if (typeof window === "undefined") return;
 
   const FLAG = "__alma_tts_strip_links_v1";
-  if (window[FLAG]) return;
-  window[FLAG] = true;
+  if ((window as any)[FLAG]) return;
+  (window as any)[FLAG] = true;
 
-  function stripLinksForVoice(text) {
+  function stripLinksForVoice(text: string): string {
     if (!text) return "";
     let t = String(text);
 
@@ -552,21 +601,20 @@ export default function Page() {
 
   const origFetch = window.fetch.bind(window);
 
-  window.fetch = async (input, init) => {
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     try {
       const url =
-        typeof input === "string" ? input :
-        (input && input.url) ? input.url :
-        String(input);
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
 
-      const isTTS =
-        url === "/api/tts" ||
-        url.endsWith("/api/tts") ||
-        url.includes("/api/tts?");
+      const isTTS = url === "/api/tts" || url.endsWith("/api/tts") || url.includes("/api/tts?");
 
       if (!isTTS) return origFetch(input, init);
 
-      const body = init && init.body;
+      const body = init?.body;
 
       // caso normal: JSON string { text: "..." }
       if (typeof body === "string") {
@@ -574,7 +622,7 @@ export default function Page() {
           const obj = JSON.parse(body);
           if (obj && typeof obj.text === "string") {
             obj.text = stripLinksForVoice(obj.text);
-            return origFetch(input, Object.assign({}, init, { body: JSON.stringify(obj) }));
+            return origFetch(input, { ...(init || {}), body: JSON.stringify(obj) });
           }
         } catch {
           // se não for JSON, não mexe
@@ -587,8 +635,3 @@ export default function Page() {
     }
   };
 })();
-</script>
-    
-   </main>
-
-
