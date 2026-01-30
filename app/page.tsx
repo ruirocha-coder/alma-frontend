@@ -514,31 +514,25 @@ export default function Page() {
           copiar
         </button>
       </div>
-
-    
-   </main>
-
-    
-  );
-}
-// =======================================================
-// HOTFIX ÚNICO — TTS sem ler links
-// Interceta fetch("/api/tts") e remove links apenas do texto enviado ao TTS.
-// Não altera UI/log, só altera o áudio.
-// Colar NO FIM do ficheiro (fora do componente / fora do JSX).
-// =======================================================
+<script>
+/* =======================================================
+   HOTFIX ÚNICO — TTS sem ler links (para HTML)
+   - Interceta fetch("/api/tts")
+   - Remove links apenas do texto enviado ao TTS
+   - NÃO altera UI/log (o texto continua a aparecer no ecrã)
+   ======================================================= */
 (() => {
   if (typeof window === "undefined") return;
+
   const FLAG = "__alma_tts_strip_links_v1";
-  if ((window as any)[FLAG]) return;
-  (window as any)[FLAG] = true;
+  if (window[FLAG]) return;
+  window[FLAG] = true;
 
-  function stripLinksForVoice(text: string): string {
+  function stripLinksForVoice(text) {
     if (!text) return "";
+    let t = String(text);
 
-    let t = text;
-
-    // 1) Remove secção final "Links dos produtos:" (o caso mais comum do RAG)
+    // 1) Remove secção final "Links dos produtos:"
     t = t.replace(/\n?\s*Links dos produtos\s*:\s*\n[\s\S]*$/i, "");
 
     // 2) Markdown links: [texto](url) -> texto
@@ -548,7 +542,7 @@ export default function Page() {
     t = t.replace(/\bhttps?:\/\/[^\s]+/gi, "");
     t = t.replace(/\bwww\.[^\s]+/gi, "");
 
-    // 4) Limpeza de restos (parêntesis, etc.)
+    // 4) Limpezas
     t = t.replace(/[()[\]{}<>]/g, " ");
     t = t.replace(/[ \t]{2,}/g, " ");
     t = t.replace(/\n{3,}/g, "\n\n");
@@ -558,17 +552,13 @@ export default function Page() {
 
   const origFetch = window.fetch.bind(window);
 
-  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+  window.fetch = async (input, init) => {
     try {
-      // Determinar URL final
       const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-          ? input.toString()
-          : (input as Request).url;
+        typeof input === "string" ? input :
+        (input && input.url) ? input.url :
+        String(input);
 
-      // Só atuar no endpoint TTS
       const isTTS =
         url === "/api/tts" ||
         url.endsWith("/api/tts") ||
@@ -576,58 +566,29 @@ export default function Page() {
 
       if (!isTTS) return origFetch(input, init);
 
-      // Se o body for JSON com { text }, limpar apenas esse texto
-      const body = init?.body;
+      const body = init && init.body;
 
+      // caso normal: JSON string { text: "..." }
       if (typeof body === "string") {
-        // body string JSON
         try {
           const obj = JSON.parse(body);
           if (obj && typeof obj.text === "string") {
             obj.text = stripLinksForVoice(obj.text);
-            return origFetch(input, { ...(init || {}), body: JSON.stringify(obj) });
+            return origFetch(input, Object.assign({}, init, { body: JSON.stringify(obj) }));
           }
         } catch {
           // se não for JSON, não mexe
         }
       }
 
-      // Se vier como Request (menos comum no teu caso), tenta clonar e mexer
-      if (input instanceof Request && !init?.body) {
-        try {
-          const ct = input.headers.get("content-type") || "";
-          if (ct.includes("application/json")) {
-            const cloned = input.clone();
-            const obj = await cloned.json().catch(() => null);
-            if (obj && typeof obj.text === "string") {
-              obj.text = stripLinksForVoice(obj.text);
-              const newReq = new Request(input, {
-                body: JSON.stringify(obj),
-                method: input.method,
-                headers: input.headers,
-                cache: input.cache,
-                credentials: input.credentials,
-                integrity: input.integrity,
-                keepalive: (input as any).keepalive,
-                mode: input.mode,
-                redirect: input.redirect,
-                referrer: input.referrer,
-                referrerPolicy: input.referrerPolicy,
-                signal: input.signal,
-              });
-              return origFetch(newReq);
-            }
-          }
-        } catch {
-          // falhou -> segue normal
-        }
-      }
-
-      // Se não conseguimos mexer com segurança, deixa passar
       return origFetch(input, init);
     } catch {
       return origFetch(input, init);
     }
   };
 })();
+</script>
+    
+   </main>
+
 
