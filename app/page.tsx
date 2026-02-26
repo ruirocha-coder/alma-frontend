@@ -5,7 +5,7 @@ import AvatarCanvas from "../components/AvatarCanvas";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
-// --- USER_ID estável para Mem0 (curto prazo)----
+// --- USER_ID estável para Mem0 (curto prazo)-----
 function getUserId() {
   try {
     const KEY = "alma_user_id";
