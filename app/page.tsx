@@ -21,7 +21,7 @@ function getUserId() {
 const USER_ID = typeof window !== "undefined" ? getUserId() : "anon";
 
 export default function Page() {
-  // ---------- PALETA (igual à do alma-chat)
+  // ---------- PALETA (igual à do alma-chat)-----
   const colors = {
     bg: "#0a0a0b",
     panel: "#0f0f11",
