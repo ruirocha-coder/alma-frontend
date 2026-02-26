@@ -5,7 +5,7 @@ import AvatarCanvas from "../components/AvatarCanvas";
 
 type LogItem = { role: "you" | "alma"; text: string };
 
-// --- USER_ID estável para Mem0 (curto prazo)-----
+// --- USER_ID estável para Mem0 (curto prazo)
 function getUserId() {
   try {
     const KEY = "alma_user_id";
@@ -18,10 +18,38 @@ function getUserId() {
     return "anon";
   }
 }
+
 const USER_ID = typeof window !== "undefined" ? getUserId() : "anon";
 
+/* =======================================================
+   TTS sem ler links
+   - Remove apenas do texto ENVIADO ao /api/tts
+   - NÃO mexe no texto mostrado no ecrã (log)
+   ======================================================= */
+function stripLinksForVoice(text: string): string {
+  if (!text) return "";
+  let t = String(text);
+
+  // 1) Remove secção final "Links dos produtos:"
+  t = t.replace(/\n?\s*Links dos produtos\s*:\s*\n[\s\S]*$/i, "");
+
+  // 2) Markdown links: [texto](url) -> texto
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, "$1");
+
+  // 3) URLs soltas
+  t = t.replace(/\bhttps?:\/\/[^\s]+/gi, "");
+  t = t.replace(/\bwww\.[^\s]+/gi, "");
+
+  // 4) Limpezas
+  t = t.replace(/[()[\]{}<>]/g, " ");
+  t = t.replace(/[ \t]{2,}/g, " ");
+  t = t.replace(/\n{3,}/g, "\n\n");
+
+  return t.trim();
+}
+
 export default function Page() {
-  // ---------- PALETA (igual à do alma-chat)-----
+  // ---------- PALETA (igual à do alma-chat)
   const colors = {
     bg: "#0a0a0b",
     panel: "#0f0f11",
@@ -50,10 +78,7 @@ export default function Page() {
   const [status, setStatus] = useState<string>("Pronto");
   const [isArmed, setIsArmed] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [transcript, setTranscript] = useState<string>("");
-  const [answer, setAnswer] = useState<string>("");
-  const [typed, setTyped] = useState<string>(""); // caixa texto→voz
-
+  const [typed, setTyped] = useState<string>("");
   const [log, setLog] = useState<LogItem[]>([]);
 
   // --- Audio / Recorder
@@ -70,6 +95,7 @@ export default function Page() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const meterRAF = useRef<number | null>(null);
   const audioPrimedRef = useRef<boolean>(false); // evita duplo toque
+  const ttsUrlRef = useRef<string | null>(null); // para revogar URL anterior
 
   // ---------- PRIME/UNLOCK ÁUDIO (resolve “duplo toque”)
   function makeSilentWavDataURL(ms = 80, sampleRate = 8000) {
@@ -79,17 +105,38 @@ export default function Page() {
     const blockAlign = numChannels * bytesPerSample;
     const byteRate = sampleRate * blockAlign;
     const dataSize = samples * blockAlign;
+
     const buffer = new ArrayBuffer(44 + dataSize);
     const view = new DataView(buffer);
 
     let o = 0;
-    const W = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i)); };
-    const U32 = (v: number) => { view.setUint32(o, v, true); o += 4; };
-    const U16 = (v: number) => { view.setUint16(o, v, true); o += 2; };
+    const W = (s: string) => {
+      for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i));
+    };
+    const U32 = (v: number) => {
+      view.setUint32(o, v, true);
+      o += 4;
+    };
+    const U16 = (v: number) => {
+      view.setUint16(o, v, true);
+      o += 2;
+    };
 
-    W("RIFF"); U32(36 + dataSize); W("WAVE"); W("fmt "); U32(16); U16(1);
-    U16(numChannels); U32(sampleRate); U32(byteRate); U16(blockAlign); U16(16);
-    W("data"); U32(dataSize);
+    W("RIFF");
+    U32(36 + dataSize);
+    W("WAVE");
+    W("fmt ");
+    U32(16);
+    U16(1);
+
+    U16(numChannels);
+    U32(sampleRate);
+    U32(byteRate);
+    U16(blockAlign);
+    U16(16);
+
+    W("data");
+    U32(dataSize);
     for (let i = 0; i < dataSize; i++) view.setInt8(o++, 0);
 
     const blob = new Blob([buffer], { type: "audio/wav" });
@@ -98,9 +145,13 @@ export default function Page() {
 
   async function ensureAudioReady() {
     if (audioPrimedRef.current) return;
+
     const AC = (window.AudioContext || (window as any).webkitAudioContext) as any;
     if (AC && !audioCtxRef.current) audioCtxRef.current = new AC();
-    try { await audioCtxRef.current?.resume(); } catch {}
+    try {
+      await audioCtxRef.current?.resume();
+    } catch {}
+
     const el = ttsAudioRef.current;
     if (el) {
       try {
@@ -108,7 +159,9 @@ export default function Page() {
         el.src = url;
         el.muted = true;
         await el.play().catch(() => {});
-        el.pause(); el.currentTime = 0; el.muted = false;
+        el.pause();
+        el.currentTime = 0;
+        el.muted = false;
         URL.revokeObjectURL(url);
       } catch {}
     }
@@ -117,6 +170,7 @@ export default function Page() {
 
   function startOutputMeter() {
     if (analyserRef.current && audioCtxRef.current && ttsAudioRef.current) return;
+
     const el = ttsAudioRef.current;
     if (!el) return;
 
@@ -133,7 +187,6 @@ export default function Page() {
 
     src.connect(analyser);
     analyser.connect(ctx.destination);
-
     analyserRef.current = analyser;
 
     const data = new Uint8Array(analyser.frequencyBinCount);
@@ -149,6 +202,7 @@ export default function Page() {
       audioLevelRef.current = level;
       meterRAF.current = requestAnimationFrame(tick);
     };
+
     if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
     meterRAF.current = requestAnimationFrame(tick);
   }
@@ -166,20 +220,28 @@ export default function Page() {
     // Desbloqueio no primeiro gesto (tap/click)
     const onFirstGesture = async () => {
       await ensureAudioReady();
-      document.removeEventListener("pointerdown", onFirstGesture);
     };
     document.addEventListener("pointerdown", onFirstGesture, { once: true });
 
     return () => {
       document.removeEventListener("pointerdown", onFirstGesture);
       if (meterRAF.current) cancelAnimationFrame(meterRAF.current);
-      try { audioCtxRef.current?.close(); } catch {}
+      try {
+        audioCtxRef.current?.close();
+      } catch {}
+      // revogar URL de áudio se existir
+      if (ttsUrlRef.current) {
+        try {
+          URL.revokeObjectURL(ttsUrlRef.current);
+        } catch {}
+        ttsUrlRef.current = null;
+      }
     };
   }, []);
 
   // --- Micro
   async function requestMic() {
-    await ensureAudioReady(); // unlock + mic
+    await ensureAudioReady();
     try {
       setStatus("A pedir permissão do micro…");
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -198,34 +260,39 @@ export default function Page() {
     // Se a Alma estiver a falar, tocar no botão interrompe
     const a = ttsAudioRef.current;
     if (a && !a.paused && !a.ended) {
-      a.pause(); a.currentTime = 0;
+      a.pause();
+      a.currentTime = 0;
       setStatus("Pronto");
       return;
     }
-    // 1º clique: ativa áudio+micro; 2º clique/segurar: grava
+
+    // 1º toque: ativa micro; depois segurar grava
     if (!isArmed) {
       requestMic();
       return;
     }
+
     if (!streamRef.current) {
       setStatus("⚠️ Micro não está pronto.");
       return;
     }
+
     try {
       setStatus("🎙️ A gravar…");
       chunksRef.current = [];
 
-      const mime =
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "audio/mp4";
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "audio/mp4";
 
-      const mr = new MediaRecorder(streamRef.current!, { mimeType: mime });
+      const mr = new MediaRecorder(streamRef.current, { mimeType: mime });
       mediaRecorderRef.current = mr;
 
-      mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
       mr.onstop = async () => {
         const blob = new Blob(chunksRef.current, { type: mr.mimeType });
         await handleTranscribeAndAnswer(blob);
@@ -259,15 +326,16 @@ export default function Page() {
         setStatus("⚠️ STT " + sttResp.status + ": " + txt.slice(0, 200));
         return;
       }
+
       const sttJson = (await sttResp.json()) as { transcript?: string; error?: string };
       const said = (sttJson.transcript || "").trim();
-      setTranscript(said);
-      setLog((l) => (said ? [...l, { role: "you", text: said }] : l));
+
       if (!said) {
         setStatus("⚠️ Não consegui transcrever o áudio. Fala mais perto do micro.");
         return;
       }
 
+      setLog((l) => [...l, { role: "you", text: said }]);
       await askAlma(said);
     } catch (e: any) {
       setStatus("⚠️ Erro: " + (e?.message || e));
@@ -276,29 +344,47 @@ export default function Page() {
 
   async function speak(text: string) {
     if (!text) return;
+
+    // Só para TTS: remove links
+    const voiceText = stripLinksForVoice(text);
+    if (!voiceText) return;
+
     try {
       await ensureAudioReady();
+
       const r = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: voiceText }),
       });
+
       if (!r.ok) {
         const txt = await r.text();
         setStatus(`⚠️ Erro no /api/tts: ${r.status} ${txt.slice(0, 200)}`);
         return;
       }
+
       const ab = await r.arrayBuffer();
       const blob = new Blob([ab], { type: "audio/mpeg" });
+
+      // revoga URL anterior para evitar leaks
+      if (ttsUrlRef.current) {
+        try {
+          URL.revokeObjectURL(ttsUrlRef.current);
+        } catch {}
+        ttsUrlRef.current = null;
+      }
+
       const url = URL.createObjectURL(blob);
+      ttsUrlRef.current = url;
 
       const audio = ttsAudioRef.current;
       if (!audio) {
         setStatus("⚠️ Áudio não inicializado.");
         return;
       }
-      audio.src = url;
 
+      audio.src = url;
       startOutputMeter();
 
       try {
@@ -313,22 +399,25 @@ export default function Page() {
 
   async function askAlma(question: string) {
     setStatus("🧠 A perguntar à Alma…");
-    setAnswer("");
+
     try {
       const almaResp = await fetch("/api/alma", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question, user_id: USER_ID }),
       });
+
       if (!almaResp.ok) {
         const txt = await almaResp.text();
         setStatus("⚠️ Erro no Alma: " + txt.slice(0, 200));
         return;
       }
+
       const almaJson = (await almaResp.json()) as { answer?: string };
       const out = (almaJson.answer || "").trim();
-      setAnswer(out);
-      setLog((l) => [...l, { role: "alma", text: out }]);
+
+      if (out) setLog((l) => [...l, { role: "alma", text: out }]);
+
       setStatus("🔊 A falar…");
       await speak(out);
       setStatus("Pronto");
@@ -337,7 +426,6 @@ export default function Page() {
     }
   }
 
-  // Enviar texto digitado
   async function sendTyped() {
     const q = typed.trim();
     if (!q) return;
@@ -364,7 +452,6 @@ export default function Page() {
     });
   }
 
-  // ---------- UI ----------
   return (
     <main
       style={{
@@ -404,7 +491,7 @@ export default function Page() {
           padding: "6px 8px",
           border: "none",
           borderRadius: 0,
-          background: colors.bg, // mesma cor do fundo → invisível
+          background: colors.bg,
           color: colors.fgDim,
           textAlign: "center",
           minHeight: 20,
@@ -413,7 +500,7 @@ export default function Page() {
         {status}
       </div>
 
-      {/* Botão único horizontal (ativa micro no 1º toque; segurar para falar no 2º) */}
+      {/* Botão único horizontal */}
       <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
         <button
           onMouseDown={onHoldStart}
@@ -436,15 +523,18 @@ export default function Page() {
         </button>
       </div>
 
-      {/* Caixa de texto → voz (invisível, centrada, sem borda) */}
+      {/* Caixa de texto → voz */}
       <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
         <input
           value={typed}
           onChange={(e) => setTyped(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") sendTyped(); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") sendTyped();
+          }}
           placeholder="Escrever para a Alma…"
           style={{
-            width: 680, maxWidth: "95%",
+            width: 680,
+            maxWidth: "95%",
             padding: "12px 14px",
             border: "none",
             outline: "none",
@@ -456,7 +546,7 @@ export default function Page() {
         />
       </div>
 
-      {/* Conversa — sem “Último”, sem “Histórico”, com botão copiar no canto inf. direito */}
+      {/* Conversa */}
       <div
         style={{
           position: "relative",
@@ -514,8 +604,6 @@ export default function Page() {
           copiar
         </button>
       </div>
-
-    
-   </main>
-
-
+    </main>
+  );
+}
